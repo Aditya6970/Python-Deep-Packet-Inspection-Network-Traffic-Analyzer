@@ -1,0 +1,12 @@
+# This project has NO third-party dependencies.
+#
+# Every import resolves to the Python standard library:
+#   collections  contextlib  dataclasses  datetime  enum  fnmatch  io
+#   os  pathlib  random  struct  subprocess  sys  tempfile  threading
+#   time  typing
+#
+# The file exists so `pip install -r requirements.txt` succeeds and returns
+# cleanly, and so tooling that expects it does not report the project as
+# unconfigured.
+#
+# Requires Python 3.10 or newer.

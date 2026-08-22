@@ -1,0 +1,46 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Environment / secrets ----
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Logs ----
+*.log
+
+# ---- Test / tool output ----
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Generated capture files.  test_dpi.pcap is a deliberate sample input and is
+# tracked; everything else this project writes is output and is not.
+*.pcap
+!test_dpi.pcap
