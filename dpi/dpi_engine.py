@@ -54,7 +54,7 @@ import struct
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Final
 
@@ -63,10 +63,11 @@ from .fast_path import FPManager
 from .load_balancer import LBManager
 from .packet_parser import PacketParser, ParsedPacket
 from .pcap_reader import PcapGlobalHeader, PcapReader, RawPacket
-from .rule_manager import RuleManager
+from .rule_manager import RuleManager, RuleStats
 from .thread_safe_queue import ThreadSafeQueue
 from .types import (
     AppType,
+    Connection,
     DPIStats,
     FiveTuple,
     PacketAction,
@@ -74,7 +75,7 @@ from .types import (
     app_type_to_string,
 )
 
-__all__ = ["Config", "DPIEngine"]
+__all__ = ["Config", "DPIEngine", "FlowSnapshot"]
 
 #: Output queue capacity, hard-coded in the C++ constructor's initialiser list.
 OUTPUT_QUEUE_SIZE: Final[int] = 10000
@@ -106,6 +107,34 @@ class Config:
     #: sleeps.  Set False to restore the original's timing-based behaviour,
     #: which silently discards in-flight packets on a large capture.
     drain_until_idle: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class FlowSnapshot:
+    """An immutable, read-only view of one completed analysis run.
+
+    Returned by :meth:`DPIEngine.get_flow_snapshot`.  Purely a container: it
+    holds references to what the engine already computed and adds no logic of
+    its own.
+
+    This exists so an external consumer -- the optional ``ai/`` layer, a JSON
+    exporter, a notebook -- can read results without reaching into the
+    engine's private attributes.  The engine has no knowledge of who consumes
+    it, and nothing in the packet path depends on this type.
+    """
+
+    #: Every tracked connection, gathered across all FP threads.
+    connections: tuple[Connection, ...] = ()
+    #: Capture-wide packet counters (see :meth:`DPIStats.snapshot`).
+    packet_stats: dict[str, int] = field(default_factory=dict)
+    #: Flow count per application.
+    app_distribution: dict[AppType, int] = field(default_factory=dict)
+    #: Most frequently seen server names, highest first.
+    top_domains: tuple[tuple[str, int], ...] = ()
+    #: Configured blocking-rule counts, or None if no rule manager exists.
+    rule_stats: RuleStats | None = None
+    num_load_balancers: int = 0
+    fps_per_lb: int = 0
 
 
 class DPIEngine:
@@ -717,6 +746,46 @@ class DPIEngine:
         """Return the configuration.  Mirrors ``getConfig``."""
         return self._config
 
+    def get_flow_snapshot(self) -> FlowSnapshot:
+        """Return a read-only view of the results of the last run.
+
+        No C++ counterpart.  Added so external consumers can read flow records
+        and statistics without touching private attributes.  **Read-only**: it
+        gathers already-computed values and mutates nothing.
+
+        Call after :meth:`process_file` has returned.  The connection trackers
+        are not cleared by :meth:`stop`, so flow records remain available.
+        Returns an empty snapshot if :meth:`initialize` was never called.
+
+        The returned ``Connection`` objects are the live records, not copies --
+        treat them as read-only.
+        """
+        connections: list[Connection] = []
+        if self._fp_manager is not None:
+            for i in range(self._fp_manager.get_num_fps()):
+                connections.extend(
+                    self._fp_manager.get_fp(i).get_connection_tracker().get_all_connections()
+                )
+
+        app_distribution: dict[AppType, int] = {}
+        top_domains: tuple[tuple[str, int], ...] = ()
+        if self._global_conn_table is not None:
+            global_stats = self._global_conn_table.get_global_stats()
+            app_distribution = dict(global_stats.app_distribution)
+            top_domains = tuple(global_stats.top_domains)
+
+        return FlowSnapshot(
+            connections=tuple(connections),
+            packet_stats=self._stats.snapshot(),
+            app_distribution=app_distribution,
+            top_domains=top_domains,
+            rule_stats=(
+                self._rule_manager.get_stats() if self._rule_manager is not None else None
+            ),
+            num_load_balancers=self._config.num_load_balancers,
+            fps_per_lb=self._config.fps_per_lb,
+        )
+
     def is_running(self) -> bool:
         """Return whether the engine is running.  Mirrors ``isRunning``."""
         return self._running.is_set()
@@ -754,4 +823,5 @@ class DPIEngine:
     printStatus = print_status
     getRuleManager = get_rule_manager
     getConfig = get_config
+    getFlowSnapshot = get_flow_snapshot
     isRunning = is_running

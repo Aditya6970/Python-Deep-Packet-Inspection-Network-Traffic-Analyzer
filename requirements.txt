@@ -1,12 +1,15 @@
-# This project has NO third-party dependencies.
+# Core DPI engine: NO third-party dependencies.  Standard library only.
 #
-# Every import resolves to the Python standard library:
-#   collections  contextlib  dataclasses  datetime  enum  fnmatch  io
-#   os  pathlib  random  struct  subprocess  sys  tempfile  threading
-#   time  typing
+# The packages below are required ONLY by the optional AI analysis layer
+# (`ai/`, `analyze_ai.py`).  Every existing tool -- main.py, main_simple.py,
+# main_working.py, main_dpi.py, dpi_mt.py -- and `run_selftests.py` run
+# without them.
 #
-# The file exists so `pip install -r requirements.txt` succeeds and returns
-# cleanly, and so tooling that expects it does not report the project as
-# unconfigured.
+# One SDK serves all three providers: Groq and Ollama both expose
+# OpenAI-compatible /chat/completions endpoints, so no `groq` or `ollama`
+# package is needed.
 #
 # Requires Python 3.10 or newer.
+
+pydantic>=2.0      # schema definition and validation of LLM responses
+openai>=1.40       # OpenAI-compatible client: OpenAI, Groq, and Ollama
