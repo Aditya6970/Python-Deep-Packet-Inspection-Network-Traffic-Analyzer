@@ -13,7 +13,7 @@ from __future__ import annotations
 from .analyzer import AnalysisOutcome
 from .schemas import AnalysisResult
 
-__all__ = ["render_analysis", "render_failure", "render"]
+__all__ = ["render_analysis", "render_failure", "render", "render_knowledge"]
 
 _WIDTH = 62
 
@@ -51,6 +51,66 @@ def _bullets(items: list[str], marker: str = "-") -> list[str]:
             out.append(f"  {marker} {first}")
             out.extend(wrapped[1:])
     return out or ["  (none)"]
+
+
+def render_knowledge(outcome: AnalysisOutcome) -> list[str]:
+    """Render what retrieval supplied, and what the model did with it.
+
+    Two different facts, deliberately shown apart:
+
+    * **retrieved** -- excerpts the retriever chose and the prompt carried.
+    * **cited** -- excerpts the model said changed its assessment.
+
+    They are routinely different, and conflating them would overstate
+    grounding: knowledge being present in the prompt is not evidence that it
+    influenced the answer. Each line is marked ``cited`` or ``not cited`` so a
+    reader can see which is which at a glance.
+
+    Returns no lines at all when retrieval was never asked for, so the non-RAG
+    report is unchanged.
+    """
+    status = outcome.rag_status or "disabled"
+
+    if not outcome.knowledge_used:
+        if status == "disabled":
+            return []
+        detail = outcome.rag_detail or "Reference knowledge was not used."
+        return ["", "KNOWLEDGE  (none used)"] + _wrap(f"{status}: {detail}")
+
+    knowledge = outcome.knowledge
+    assert knowledge is not None  # knowledge_used guarantees this
+    cited = set(outcome.knowledge_refs())
+
+    lines = ["", "KNOWLEDGE RETRIEVED  (reference material supplied to the model)"]
+    for item in knowledge.items:
+        mark = "cited" if item.ref in cited else "not cited"
+        lines.append(
+            f"  [{item.ref}] {item.citation()}"
+        )
+        signals = ", ".join(s.value for s in item.matched_signal_types) or "capture profile"
+        lines.append(
+            f"       similarity: {item.similarity:.2f}   {mark}"
+        )
+        lines.append(f"       matched signals: {signals}")
+
+    if cited:
+        order = sorted(cited, key=lambda ref: int(ref[1:]))
+        lines.append("")
+        lines.append("  Cited by the model: " + ", ".join(order))
+    else:
+        lines.append("")
+        lines.append(
+            "  Cited by the model: none  (the excerpts did not change the assessment)"
+        )
+
+    for note in knowledge.notes:
+        lines.extend(_wrap(note, indent="  "))
+
+    if outcome.signal_types:
+        lines.append("")
+        lines.append("  Signals that drove retrieval: " + ", ".join(outcome.signal_types))
+
+    return lines
 
 
 def render_analysis(outcome: AnalysisOutcome) -> str:
@@ -123,6 +183,8 @@ def render_analysis(outcome: AnalysisOutcome) -> str:
             "NOTABLE FLOWS: " + ", ".join(str(i) for i in a.notable_flow_ids)
         )
 
+    lines.extend(render_knowledge(outcome))
+
     if outcome.warnings:
         lines.append("")
         lines.append("VALIDATION WARNINGS")
@@ -134,10 +196,17 @@ def render_analysis(outcome: AnalysisOutcome) -> str:
         lines.extend(_bullets(r.notes))
 
     lines.append("")
+    knowledge_note = (
+        f"knowledge: {len(outcome.knowledge.items)} supplied, "
+        f"{len(outcome.knowledge_refs())} cited"
+        if outcome.knowledge_used and outcome.knowledge is not None
+        else f"knowledge: {outcome.rag_status}"
+    )
     lines.append(
         f"[provider {outcome.provider or '?'} | prompt v{outcome.prompt_version} | "
         f"schema v{a.schema_version} | {outcome.attempts} attempt(s) | "
-        f"{outcome.elapsed_seconds:.1f}s | ip mode: {r.redaction_mode}]"
+        f"{outcome.elapsed_seconds:.1f}s | ip mode: {r.redaction_mode} | "
+        f"{knowledge_note}]"
     )
 
     return "\n".join(lines) + "\n"
@@ -167,6 +236,10 @@ def render_failure(outcome: AnalysisOutcome) -> str:
         lines.extend(_wrap(outcome.detail))
     lines.append("")
     lines.extend(_wrap(outcome.guidance()))
+    if outcome.rag_status and outcome.rag_status != "disabled":
+        lines.append("")
+        lines.extend(_wrap(f"Knowledge retrieval: {outcome.rag_status} -- "
+                           f"{outcome.rag_detail}"))
     lines.append("")
     lines.append("  The DPI analysis above is complete and unaffected.")
     return "\n".join(lines) + "\n"

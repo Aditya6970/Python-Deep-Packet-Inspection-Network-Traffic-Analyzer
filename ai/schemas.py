@@ -29,8 +29,9 @@ instruction can: a claim placed under ``interpretation`` is self-labelling.
 
 from __future__ import annotations
 
+import re
 from enum import Enum
-from typing import Annotated, Literal
+from typing import Annotated, Final, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -51,6 +52,15 @@ __all__ = [
 
 #: Bumped when the output shape changes, so stored results stay parseable.
 SCHEMA_VERSION = "1.0"
+
+#: Shape of a reference-knowledge label: ``K`` followed by a 1-based index.
+_KNOWLEDGE_REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"^K[1-9][0-9]*$")
+
+
+def _knowledge_ref_order(ref: str) -> tuple[int, str]:
+    """Sort K-labels numerically, so K10 follows K9 rather than K1."""
+    return (int(ref[1:]), ref) if _KNOWLEDGE_REF_PATTERN.match(ref) else (0, ref)
+
 
 
 # ===========================================================================
@@ -246,7 +256,11 @@ class AnalysisResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1.0"] = "1.0"
+    #: 1.1 added :attr:`knowledge_refs`.  The addition is backwards compatible
+    #: -- it defaults to empty, so a run with no retrieved knowledge produces
+    #: the same object it always did -- but the version records that the shape
+    #: changed, which is what a version is for.
+    schema_version: Literal["1.1"] = "1.1"
 
     summary: str = Field(
         min_length=1, max_length=2000, description="Two to four sentences, plain language."
@@ -275,6 +289,58 @@ class AnalysisResult(BaseModel):
     notable_flow_ids: list[int] = Field(
         default_factory=list, description="Flow ids worth attention. Must exist in the input."
     )
+    knowledge_refs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Reference knowledge labels (K1, K2, ...) that materially changed this "
+            "assessment. Empty is correct when the knowledge did not change anything, "
+            "or when none was supplied. Every entry must exist in the supplied set."
+        ),
+    )
+
+    @field_validator("knowledge_refs")
+    @classmethod
+    def _knowledge_refs_well_formed(cls, v: list[str]) -> list[str]:
+        """Shape and uniqueness, before anything is checked against a context.
+
+        A duplicate is rejected rather than de-duplicated: citing K1 twice is
+        not a formatting slip to tidy away, it is the model producing a
+        reference list that does not mean what it says.
+        """
+        for ref in v:
+            if not _KNOWLEDGE_REF_PATTERN.match(ref):
+                raise ValueError(
+                    f"knowledge_refs entry {ref!r} is malformed; expected K1, K2, ..."
+                )
+        if len(set(v)) != len(v):
+            duplicates = sorted({ref for ref in v if v.count(ref) > 1})
+            raise ValueError(f"knowledge_refs contains duplicates: {duplicates}")
+        return v
+
+    def validate_knowledge_references(self, supplied: Iterable[str]) -> list[str]:
+        """Check every cited knowledge label was actually supplied.
+
+        The mirror image of :meth:`validate_flow_references`, and the reason
+        :attr:`knowledge_refs` exists: without it, a claim that "the knowledge
+        said so" is unverifiable.  If the model cites K7 when four chunks were
+        supplied, or cites anything at all when none were, that is caught here.
+
+        Returns human-readable problems; empty means clean.  Callers treat a
+        non-empty result as a rejected response rather than a warning -- an
+        invented citation is a fabricated source, not a cosmetic error.
+        """
+        known = set(supplied)
+        unknown = sorted(set(self.knowledge_refs) - known, key=_knowledge_ref_order)
+        if not unknown:
+            return []
+        if not known:
+            return [
+                f"knowledge_refs cites {unknown} but no reference knowledge was supplied"
+            ]
+        return [
+            f"knowledge_refs cites labels that were not supplied: {unknown} "
+            f"(supplied: {sorted(known, key=_knowledge_ref_order)})"
+        ]
 
     def validate_flow_references(self, known_ids: set[int]) -> list[str]:
         """Check every referenced flow id exists in the input.

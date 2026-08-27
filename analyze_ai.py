@@ -47,7 +47,16 @@ Options:
   --ip-mode <mode>       full | redact_private | none  (default redact_private)
   --model <name>         Override the model for the selected provider
   --no-ai                Run DPI only; skip the AI layer entirely
+  --no-rag               Skip knowledge retrieval; send the capture alone
+  --show-knowledge       Print the retrieved reference excerpts, then continue
   --show-payload         Print the exact JSON that would be sent, then exit
+
+Retrieval (RAG):
+  On by default. The capture is turned into signals, matching excerpts are
+  retrieved from knowledge/ and supplied to the model as reference material.
+  Needs the optional dependencies: pip install -r requirements-rag.txt
+  If they are missing, or the embedding model cannot be loaded, the analysis
+  still runs -- without knowledge, and the report says so.
 
 Environment:
   DPI_LLM_PROVIDER       groq (default) | ollama | openai
@@ -60,6 +69,8 @@ Examples:
   {program} test_dpi.pcap
   {program} test_dpi.pcap --provider groq --block-app YouTube
   {program} test_dpi.pcap --provider ollama --model llama3.1
+  {program} test_dpi.pcap --provider groq --no-rag
+  {program} test_dpi.pcap --provider groq --show-knowledge
   {program} test_dpi.pcap --show-payload
 """, end="")
 
@@ -83,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     model = ""
     provider = ""
     use_ai = True
+    use_rag = True
+    show_knowledge = False
     show_payload = False
     block_ips: list[str] = []
     block_apps: list[str] = []
@@ -117,6 +130,10 @@ def main(argv: list[str] | None = None) -> int:
             i += 1; provider = argv[i]
         elif arg == "--no-ai":
             use_ai = False
+        elif arg == "--no-rag":
+            use_rag = False
+        elif arg == "--show-knowledge":
+            show_knowledge = True
         elif arg == "--show-payload":
             show_payload = True
         i += 1
@@ -183,12 +200,34 @@ def main(argv: list[str] | None = None) -> int:
     if model:
         ai_config.model = model
 
+    # ---- Stage 2a: optional knowledge retrieval --------------------------
+    # Built here rather than inside the analyzer so the CLI owns the policy:
+    # retrieval is on by default, and --no-rag turns it off.  A missing
+    # dependency or model is reported, never fatal.
+    pipeline = None
+    if use_rag:
+        try:
+            from ai.rag.pipeline import default_pipeline
+        except ImportError as exc:
+            print(f"\n[knowledge retrieval unavailable: {exc}]")
+            print("Install the optional RAG dependencies with: "
+                  "pip install -r requirements-rag.txt")
+        else:
+            pipeline = default_pipeline()
+
     if show_payload:
         from ai.extractor import build_capture_report
         from ai.prompts import build_messages
 
         report = build_capture_report(snapshot, input_file, ai_config)
-        messages = build_messages(report)
+        knowledge_text = None
+        if pipeline is not None:
+            rag_outcome = pipeline.build_context(report)
+            knowledge_text = rag_outcome.knowledge_text()
+            if knowledge_text is None:
+                print(f"\n[no reference knowledge: {rag_outcome.status.value} -- "
+                      f"{rag_outcome.describe()}]")
+        messages = build_messages(report, None, knowledge_text)
         print("\n===== EXACTLY WHAT WOULD BE SENT =====\n")
         for m in messages:
             print(f"--- role: {m['role']} ---")
@@ -196,7 +235,17 @@ def main(argv: list[str] | None = None) -> int:
             print()
         return 0
 
-    outcome = analyze_capture(snapshot, input_file, ai_config)
+    outcome = analyze_capture(snapshot, input_file, ai_config, rag=pipeline)
+
+    if show_knowledge:
+        print()
+        if outcome.knowledge_used and outcome.knowledge is not None:
+            print("===== REFERENCE KNOWLEDGE SUPPLIED TO THE MODEL =====\n")
+            print(outcome.knowledge.text)
+            print()
+        else:
+            print(f"[no reference knowledge: {outcome.rag_status} -- "
+                  f"{outcome.rag_detail}]")
 
     print()
     print(render(outcome))
@@ -207,6 +256,12 @@ def main(argv: list[str] | None = None) -> int:
             "model": outcome.model,
             "prompt_version": outcome.prompt_version,
             "warnings": outcome.warnings,
+            "rag_status": outcome.rag_status,
+            "signal_types": list(outcome.signal_types),
+            "knowledge_supplied": [
+                item.metadata() for item in outcome.knowledge.items
+            ] if outcome.knowledge is not None else [],
+            "knowledge_cited": list(outcome.knowledge_refs()),
             "analysis": outcome.analysis.model_dump(mode="json"),
         }
         Path(json_file).write_text(

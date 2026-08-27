@@ -18,15 +18,20 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dpi.dpi_engine import FlowSnapshot
 
 from .config import AIConfig
 from .extractor import build_capture_report
 from .llm_client import FailureReason, LLMClient, create_client
-from .prompts import PROMPT_VERSION, build_messages
+from .prompts import PROMPT_VERSION, build_messages, prompt_version
 from .providers import StructuredMode
 from .schemas import AnalysisResult, CaptureReport
+
+if TYPE_CHECKING:  # pragma: no cover - typing only; ai/ never needs ai/rag/
+    from .rag.context import KnowledgeContext
+    from .rag.pipeline import KnowledgePipeline, RAGOutcome
 
 __all__ = ["AnalysisOutcome", "analyze_capture", "explain_failure"]
 
@@ -120,9 +125,31 @@ class AnalysisOutcome:
     #: Kept so :meth:`guidance` can name the provider and its setup steps.
     config: AIConfig | None = None
 
+    # --- retrieval-augmented generation, all optional --------------------
+    #: The reference block supplied to the model, when one was.
+    knowledge: "KnowledgeContext | None" = None
+    #: Why knowledge was or was not used -- a ``RAGStatus`` value, as a string
+    #: so this dataclass stays importable with no RAG dependencies installed.
+    rag_status: str = "disabled"
+    #: Human-readable explanation of ``rag_status``.
+    rag_detail: str = ""
+    #: Signal types the capture produced, when signal extraction ran.
+    signal_types: tuple[str, ...] = ()
+
     @property
     def ok(self) -> bool:
         return self.analysis is not None
+
+    @property
+    def knowledge_used(self) -> bool:
+        """True only when reference knowledge actually reached the model."""
+        return self.knowledge is not None and bool(self.knowledge.items)
+
+    def knowledge_refs(self) -> tuple[str, ...]:
+        """Labels the model cited, in the order it gave them."""
+        if self.analysis is None:
+            return ()
+        return tuple(self.analysis.knowledge_refs)
 
     def guidance(self) -> str:
         """What the user should do about a failure."""
@@ -134,17 +161,35 @@ def analyze_capture(
     capture_path: str | Path,
     config: AIConfig | None = None,
     client: LLMClient | None = None,
+    rag: "KnowledgePipeline | None" = None,
 ) -> AnalysisOutcome:
     """Analyse one capture. Never raises for an expected failure.
 
     ``client`` may be injected — pass a
     :class:`~ai.llm_client.FakeLLMClient` to run the full pipeline offline.
+
+    ``rag`` may be a :class:`~ai.rag.pipeline.KnowledgePipeline`. When supplied,
+    signals are extracted from the report, knowledge is retrieved for them, and
+    the excerpts are added to the prompt. **The default is ``None``**: the
+    library does not turn retrieval on by itself, so every existing caller
+    keeps the exact behaviour it had. ``analyze_ai.py`` opts in.
+
+    A pipeline that cannot produce knowledge — no dependencies, no model, no
+    corpus, nothing matched — is not an error. The analysis proceeds without
+    it, and ``rag_status`` on the outcome says which of those happened.
     """
     cfg = config or AIConfig.from_env()
     started = time.monotonic()
 
     # --- deterministic stages: always run, never need a network ------------
     report = build_capture_report(snapshot, capture_path, cfg)
+
+    # --- optional retrieval: deterministic, local, never fatal -------------
+    rag_outcome: "RAGOutcome | None" = None
+    knowledge_text: str | None = None
+    if rag is not None:
+        rag_outcome = rag.build_context(report)
+        knowledge_text = rag_outcome.knowledge_text()
 
     # The provider is chosen here and nowhere else; this function never names
     # one.  An unrecognised DPI_LLM_PROVIDER is refused rather than silently
@@ -166,6 +211,7 @@ def analyze_capture(
             model=cfg.model,
             config=cfg,
             elapsed_seconds=time.monotonic() - started,
+            **_rag_fields(rag_outcome),
         )
 
     # --- non-deterministic stage ------------------------------------------
@@ -177,7 +223,7 @@ def analyze_capture(
         if cfg.spec.structured_mode is StructuredMode.JSON_OBJECT
         else None
     )
-    messages = build_messages(report, schema)
+    messages = build_messages(report, schema, knowledge_text)
     result = llm.complete_structured(messages, AnalysisResult)
 
     if not result.ok or not isinstance(result.parsed, AnalysisResult):
@@ -189,12 +235,36 @@ def analyze_capture(
             provider=result.provider or cfg.provider.value,
             config=cfg,
             attempts=result.attempts,
+            prompt_version=prompt_version(bool(knowledge_text)),
             elapsed_seconds=time.monotonic() - started,
+            **_rag_fields(rag_outcome),
         )
 
     analysis = result.parsed
+    supplied_refs = rag_outcome.refs if rag_outcome is not None else ()
 
-    # --- post-validation: the mechanical hallucination check ---------------
+    # --- post-validation: the mechanical hallucination checks --------------
+    # An invented knowledge citation is a fabricated source, so unlike an
+    # invented flow id it is fatal rather than a warning: the response claims
+    # support from a document that was never supplied, and no part of it can be
+    # trusted to have come from where it says.  The references are never
+    # silently stripped -- that would hide the fabrication and keep the text
+    # that depended on it.
+    citation_problems = analysis.validate_knowledge_references(supplied_refs)
+    if citation_problems:
+        return AnalysisOutcome(
+            report=report,
+            failure=FailureReason.INVALID_RESPONSE,
+            detail="; ".join(citation_problems),
+            model=result.model or cfg.model,
+            provider=result.provider or cfg.provider.value,
+            config=cfg,
+            attempts=result.attempts,
+            prompt_version=prompt_version(bool(knowledge_text)),
+            elapsed_seconds=time.monotonic() - started,
+            **_rag_fields(rag_outcome),
+        )
+
     # A referenced flow that does not exist is caught here rather than trusted.
     warnings = analysis.validate_flow_references(report.flow_ids())
 
@@ -212,5 +282,23 @@ def analyze_capture(
         provider=result.provider or cfg.provider.value,
         config=cfg,
         attempts=result.attempts,
+        prompt_version=prompt_version(bool(knowledge_text)),
         elapsed_seconds=time.monotonic() - started,
+        **_rag_fields(rag_outcome),
     )
+
+
+def _rag_fields(outcome: "RAGOutcome | None") -> dict[str, object]:
+    """The retrieval-related fields of an :class:`AnalysisOutcome`.
+
+    One place, so every early return carries the same RAG state and none can
+    drift into reporting "disabled" for a run that actually retrieved.
+    """
+    if outcome is None:
+        return {}
+    return {
+        "knowledge": outcome.context if outcome.used else None,
+        "rag_status": outcome.status.value,
+        "rag_detail": outcome.describe(),
+        "signal_types": outcome.signal_types,
+    }
