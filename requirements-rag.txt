@@ -15,4 +15,12 @@
 # network.  Set DPI_EMBED_OFFLINE=1 to require the cached copy and fail rather
 # than fetch.
 
+# numpy is required by the vector store (ai/rag/vector_store.py), which does
+# its own cosine similarity over an N x D matrix.  sentence-transformers
+# already installs numpy, but it is declared here in its own right: the vector
+# store needs *only* numpy, so `pip install numpy` alone is enough to build and
+# search an index from vectors you already have.  No vector database is used
+# or wanted -- 37 chunks do not need approximate nearest neighbours.
+
+numpy>=1.24
 sentence-transformers>=3.0
