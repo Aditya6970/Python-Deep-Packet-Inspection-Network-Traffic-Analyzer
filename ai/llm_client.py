@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -29,6 +30,7 @@ from .providers import StructuredMode, to_strict_json_schema
 
 __all__ = [
     "FailureReason",
+    "describe_provider_error",
     "LLMResult",
     "LLMClient",
     "ProviderClient",
@@ -42,6 +44,134 @@ T = TypeVar("T", bound=BaseModel)
 #: Backoff base, in seconds.  Attempt n waits roughly base * 2**n plus jitter.
 _BACKOFF_BASE_SECONDS = 0.5
 _BACKOFF_MAX_SECONDS = 8.0
+
+#: Longest provider message kept in a failure detail.
+#:
+#: A provider explaining a 400 sometimes quotes part of the request back.  The
+#: request contains sanitized hostnames from the capture, which are already in
+#: the report -- but there is no reason to carry an unbounded amount of it into
+#: a log line, so the message is truncated hard.
+_MAX_PROVIDER_MESSAGE = 300
+
+#: Patterns redacted from any provider text before it is shown.
+#:
+#: Ordered from most specific to most general.  The final rule catches any long
+#: opaque token, which over-redacts occasionally -- that is the right direction
+#: to be wrong in.
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(?:sk|gsk|xai|pk|api)[-_][A-Za-z0-9_\-]{6,}", re.IGNORECASE),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{6,}"),
+    re.compile(
+        r"(?i)\b(?:api[-_]?key|authorization|access[-_]?token|secret|password)\b"
+        r"\s*[:=]\s*\"?[^\s\"',}]{4,}"
+    ),
+    re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"),
+)
+
+#: A structured field is only shown if it looks like an identifier.  Anything
+#: else is dropped rather than sanitized: these fields are short machine codes,
+#: so a value that is not one is not worth showing.
+_SAFE_TOKEN = re.compile(r"^[A-Za-z0-9._\-]{1,64}$")
+
+
+def _redact(text: str) -> str:
+    """Remove anything key-shaped, collapse to one line, and truncate."""
+    cleaned = " ".join(str(text).split())
+    for pattern in _SECRET_PATTERNS:
+        cleaned = pattern.sub("[redacted]", cleaned)
+    if len(cleaned) > _MAX_PROVIDER_MESSAGE:
+        cleaned = cleaned[:_MAX_PROVIDER_MESSAGE] + "..."
+    return cleaned
+
+
+def _safe_token(value: object) -> str | None:
+    """Return a short machine code, or ``None`` if it does not look like one."""
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value)
+    return text if _SAFE_TOKEN.match(text) else None
+
+
+def _error_body(exc: Exception) -> dict[str, Any] | None:
+    """The provider's ``{"error": {...}}`` payload, when it sent one."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        inner = body.get("error")
+        return inner if isinstance(inner, dict) else body
+    return None
+
+
+def _request_id(exc: Exception) -> str | None:
+    """The provider's request id, from the exception or one named header.
+
+    Only ``x-request-id`` is read.  Response headers also carry the credentials
+    that were sent, so they are never iterated -- one key is looked up by name
+    and nothing else is touched.
+    """
+    direct = _safe_token(getattr(exc, "request_id", None))
+    if direct:
+        return direct
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        return _safe_token(headers.get("x-request-id"))
+    except Exception:  # noqa: BLE001 - a header mapping that misbehaves
+        return None
+
+
+def describe_provider_error(exc: Exception) -> str:
+    """Summarise a provider exception without leaking anything secret.
+
+    ``APIStatusError`` and its subclasses carry the only information that makes
+    a live failure diagnosable -- the HTTP status, the provider's own error
+    code and message, and a request id support can look up.  Reporting the
+    exception class alone, as this used to, produces ``"APIStatusError"``:
+    technically accurate and completely useless, since a retired model, an
+    oversized request and an unsupported response format all arrive as one.
+
+    What is included: the exception class, the HTTP status, ``code``, ``type``,
+    the request id, and the provider's message.
+
+    What is never included: the API key, the ``Authorization`` header, any
+    other header, the request body, the prompt, or any environment value.
+    The message is redacted against key-shaped patterns and truncated to
+    :data:`_MAX_PROVIDER_MESSAGE` characters; ``code``, ``type`` and the
+    request id are dropped unless they look like short machine identifiers.
+
+    Classification is untouched -- this function only produces the human-facing
+    ``detail`` string that travels beside an unchanged
+    :class:`FailureReason`.
+    """
+    parts: list[str] = [type(exc).__name__]
+
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        parts.append(f"HTTP {status}")
+
+    body = _error_body(exc)
+    if body is not None:
+        code = _safe_token(body.get("code"))
+        if code:
+            parts.append(f"code={code}")
+        error_type = _safe_token(body.get("type"))
+        if error_type:
+            parts.append(f"type={error_type}")
+
+    request_id = _request_id(exc)
+    if request_id:
+        parts.append(f"request_id={request_id}")
+
+    message = body.get("message") if body is not None else None
+    if not isinstance(message, str) or not message.strip():
+        # No structured message: fall back to the exception's own text, which
+        # for an APIStatusError already contains the status and body.
+        message = str(exc)
+    if message.strip():
+        parts.append(f"message={_redact(message)}")
+
+    return "; ".join(parts)
 
 
 class FailureReason(str, Enum):
@@ -311,9 +441,9 @@ class ProviderClient:
 
             except Exception as exc:  # noqa: BLE001 - deliberately broad
                 last_reason, retryable = self._classify(exc)
-                # Keep the type only: never echo a provider message verbatim,
-                # in case it reflects request material back.
-                last_detail = type(exc).__name__
+                # The provider's own status, code and message, redacted and
+                # truncated.  Never the key, never a header, never the request.
+                last_detail = describe_provider_error(exc)
                 if not retryable or attempt >= cfg.max_retries:
                     break
                 time.sleep(_backoff(attempt))

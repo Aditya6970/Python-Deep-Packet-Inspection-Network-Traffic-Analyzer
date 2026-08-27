@@ -395,6 +395,113 @@ def test_client_and_analyzer() -> None:
     except ImportError:
         skip("SDK exception classification", "openai/httpx not installed")
 
+    # -- diagnosing a live provider failure --------------------------------
+    # An APIStatusError used to be reported as the string "APIStatusError",
+    # which is the same for a retired model, an oversized request and an
+    # unsupported response format.  The detail now carries the provider's own
+    # status, code, type, request id and message -- redacted and truncated.
+    try:
+        import httpx
+        import openai
+
+        from ai.llm_client import describe_provider_error
+
+        SECRET = "gsk_LIVEKEYSHOULDNEVERAPPEAR1234567890"
+        request = httpx.Request(
+            "POST", "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {SECRET}"},
+        )
+        response = httpx.Response(
+            413, request=request,
+            headers={"x-request-id": "req_01jabcdefgh", "authorization": f"Bearer {SECRET}"},
+        )
+        status_error = openai.APIStatusError(
+            "Error code: 413", response=response,
+            body={"error": {
+                "message": ("Request too large for model openai/gpt-oss-20b. "
+                            f"Limit 6000 TPM. Key {SECRET} was used."),
+                "type": "tokens",
+                "code": "rate_limit_exceeded",
+            }},
+        )
+        described = describe_provider_error(status_error)
+
+        check("the diagnostic names the exception type", "APIStatusError" in described)
+        check("the diagnostic reports the HTTP status", "HTTP 413" in described, described)
+        check("the diagnostic reports the provider error code",
+              "code=rate_limit_exceeded" in described, described)
+        check("the diagnostic reports the provider error type",
+              "type=tokens" in described, described)
+        check("the diagnostic reports the request id",
+              "request_id=req_01jabcdefgh" in described, described)
+        check("the diagnostic reports the provider message",
+              "Request too large for model" in described, described)
+
+        # The security half: everything above, and nothing secret.
+        check("the diagnostic never contains the API key", SECRET not in described)
+        check("the diagnostic never contains a bearer token",
+              "Bearer " not in described and "bearer " not in described.lower())
+        check("the key is visibly redacted rather than dropped silently",
+              "[redacted]" in described, described)
+        check("the diagnostic never contains an Authorization header",
+              "authorization" not in described.lower())
+        check("the diagnostic is a single line", "\n" not in described)
+        check("the diagnostic is bounded in length", len(described) < 600, str(len(described)))
+
+        # A key in the environment must not reach the detail either.
+        previous_key = os.environ.get("GROQ_API_KEY")
+        os.environ["GROQ_API_KEY"] = SECRET
+        try:
+            check("an environment key never reaches the diagnostic",
+                  SECRET not in describe_provider_error(status_error))
+        finally:
+            if previous_key is None:
+                os.environ.pop("GROQ_API_KEY", None)
+            else:
+                os.environ["GROQ_API_KEY"] = previous_key
+
+        # Other shapes must not crash the describer.
+        bare = openai.APIStatusError(
+            f"Error code: 401 - invalid api key {SECRET}",
+            response=httpx.Response(401, request=request), body=None)
+        bare_described = describe_provider_error(bare)
+        check("a response with no JSON body still reports the status",
+              "HTTP 401" in bare_described, bare_described)
+        check("a response with no JSON body still redacts the key",
+              SECRET not in bare_described, bare_described)
+        connection = describe_provider_error(openai.APIConnectionError(request=request))
+        check("a non-status exception is still described",
+              "APIConnectionError" in connection, connection)
+        check("a non-status exception leaks nothing", SECRET not in connection)
+
+        # Classification is unchanged by the new detail.
+        check("a 413 still classifies as api_error",
+              OpenAIClient._classify(status_error)[0] is FailureReason.API_ERROR)
+        check("a 413 is still not retried", OpenAIClient._classify(status_error)[1] is False)
+
+        # And the detail reaches LLMResult through the normal retry loop.
+        class _FailingClient(OpenAIClient):
+            def _call_once(self, messages, schema):  # noqa: D102 - test double
+                raise status_error
+
+        failing = _FailingClient(AIConfig(provider=Provider.GROQ, api_key="test-key",
+                                          max_retries=0))
+        live_like = failing.complete_structured([], AnalysisResult)
+        check("the failure detail reaches LLMResult",
+              "HTTP 413" in live_like.detail and "code=rate_limit_exceeded" in live_like.detail,
+              live_like.detail)
+        check("the failure reason is unchanged",
+              live_like.failure is FailureReason.API_ERROR, str(live_like.failure))
+        check("the LLMResult detail carries no key", SECRET not in live_like.detail)
+        degraded = analyze_capture(snap, "test_dpi.pcap", cfg, client=failing)
+        check("graceful degradation is unchanged",
+              not degraded.ok and len(degraded.report.flows) > 0)
+        check("the analysis outcome carries the diagnostic",
+              "HTTP 413" in degraded.detail, degraded.detail)
+        check("the analysis outcome carries no key", SECRET not in degraded.detail)
+    except ImportError:
+        skip("provider error diagnostics", "openai/httpx not installed")
+
     unavailable = analyze_capture(snap, "test_dpi.pcap",
                                   AIConfig(provider=Provider.OPENAI, api_key=None),
                                   client=FakeLLMClient(available=False))
