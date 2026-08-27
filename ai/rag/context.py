@@ -24,9 +24,12 @@ objects that already exist.
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 from dataclasses import dataclass
-from typing import Final, Sequence
+from enum import Enum
+from typing import Final, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -37,12 +40,22 @@ from .retrieval import RetrievalReport, RetrievedChunk
 from .signals import SignalType
 
 __all__ = [
+    "CHARS_PER_TOKEN",
+    "DEFAULT_MAX_CHARS",
+    "DEFAULT_MAX_ITEMS",
+    "DEFAULT_MAX_TOKENS",
+    "ENV_MAX_CHARS",
+    "ENV_MAX_ITEMS",
+    "ENV_MAX_TOKENS",
     "KNOWLEDGE_BLOCK_END",
     "KNOWLEDGE_BLOCK_START",
+    "BudgetReason",
+    "ExcludedKnowledge",
     "KnowledgeContext",
     "KnowledgeContextConfig",
     "KnowledgeItem",
     "build_knowledge_context",
+    "estimate_tokens",
 ]
 
 #: Delimiters around the reference block, matching the capture-data markers.
@@ -55,31 +68,138 @@ _REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"^K[1-9][0-9]*$")
 _FENCE_PATTERN: Final[re.Pattern[str]] = re.compile(r"={5,}")
 
 
+#: Characters per token used by :func:`estimate_tokens`.
+#:
+#: Deliberately pessimistic.  English prose runs nearer four characters per
+#: token, but this corpus is full of things that tokenize far worse -- field
+#: names like ``syn_ack_seen``, identifiers like ``T1071.004``, backticked code
+#: fragments.  A budget that *underestimates* tokens is worthless, because the
+#: request it approves is the one the provider rejects; overestimating only
+#: costs a little unused headroom.
+CHARS_PER_TOKEN: Final[float] = 3.5
+
+#: Budget defaults, named so :meth:`KnowledgeContextConfig.from_env` can read
+#: them -- a ``slots`` dataclass exposes descriptors rather than values on the
+#: class, so ``cls.max_items`` is not the default.
+DEFAULT_MAX_ITEMS: Final[int] = 4
+DEFAULT_MAX_CHARS: Final[int] = 3000
+DEFAULT_MAX_TOKENS: Final[int | None] = 900
+
+ENV_MAX_ITEMS: Final[str] = "DPI_RAG_MAX_ITEMS"
+ENV_MAX_CHARS: Final[str] = "DPI_RAG_MAX_CHARS"
+ENV_MAX_TOKENS: Final[str] = "DPI_RAG_MAX_TOKENS"
+
+
+def estimate_tokens(text: str) -> int:
+    """Approximate the token count of ``text``, with no tokenizer dependency.
+
+    A character ratio, not a tokenizer.  Loading a real tokenizer would mean
+    pulling in ``tiktoken`` or the provider's own vocabulary -- a dependency,
+    a download, and a number that is still only correct for one provider.  The
+    ratio is provider-neutral, costs nothing, and is accurate enough for a
+    budget whose job is to stay comfortably under a limit rather than to sit
+    exactly on it.
+
+    It is an **estimate** and is named one everywhere it is reported.
+    """
+    return _tokens_for(len(text))
+
+
+def _tokens_for(characters: int) -> int:
+    """Token estimate for a length, so a budget check needs no string."""
+    return math.ceil(characters / CHARS_PER_TOKEN) if characters > 0 else 0
+
+
+class BudgetReason(str, Enum):
+    """Why an excerpt was left out of the prompt."""
+
+    MAX_ITEMS = "max_items"
+    MAX_CHARS = "max_chars"
+    MAX_TOKENS = "max_total_tokens"
+
+
 @dataclass(frozen=True, slots=True)
 class KnowledgeContextConfig:
     """How much retrieved knowledge may reach a prompt.
 
-    Deliberately conservative.  Retrieval already caps how many chunks come
-    back; this is the second, prompt-facing limit, and it exists because the
-    number of chunks that is useful to a reader is smaller than the number a
-    context window can physically hold.
+    This is the second, prompt-facing limit: retrieval already caps how many
+    chunks come back, and this decides how many of them a request can afford to
+    carry.  It exists because a provider will reject an oversized request
+    outright -- and when it does, the analysis is lost, not merely degraded.
+
+    Provider-neutral on purpose.  The limits are expressed in excerpts,
+    characters and estimated tokens, never in one vendor's quota; mapping a
+    particular provider's ceiling onto these numbers is the operator's job,
+    through configuration or the CLI.  Nothing in the RAG layer knows which
+    provider it is feeding.
+
+    The DPI capture data is **not** governed by this budget and never will be.
+    Facts are the evidence; reference material is the commentary.  When
+    something has to give, the commentary gives.
     """
 
     #: Most excerpts to include.
-    max_items: int = 6
+    max_items: int = DEFAULT_MAX_ITEMS
 
-    #: Ceiling on the total characters of chunk text (excluding headers).
+    #: Ceiling on the **rendered** size of the whole block, in characters.
     #:
-    #: Roughly 1500 tokens of English at four characters per token -- enough
-    #: for several sections, small enough to leave the capture JSON dominant in
-    #: the prompt, which is the intended balance: the capture is the evidence.
-    max_chars: int = 6000
+    #: Rendered, not raw: the provenance header of each excerpt (document,
+    #: section, category, similarity, citation, matched signals) is roughly
+    #: 150 characters, so budgeting the chunk text alone understates what the
+    #: request actually carries -- which is precisely the mistake that lets an
+    #: oversized request through.
+    max_chars: int = DEFAULT_MAX_CHARS
+
+    #: Ceiling on the estimated tokens of the rendered block.
+    #:
+    #: ``None`` disables it and leaves ``max_chars`` in charge.  The two are
+    #: near-equivalent by construction; the token form exists because provider
+    #: limits are published in tokens, so an operator can transcribe a quota
+    #: without converting it.
+    max_total_tokens: int | None = DEFAULT_MAX_TOKENS
 
     def __post_init__(self) -> None:
         if self.max_items < 0:
             raise ValueError("max_items must be zero or positive")
         if self.max_chars < 0:
             raise ValueError("max_chars must be zero or positive")
+        if self.max_total_tokens is not None and self.max_total_tokens < 0:
+            raise ValueError("max_total_tokens must be None or zero or positive")
+
+    @classmethod
+    def from_env(cls, **overrides: object) -> KnowledgeContextConfig:
+        """Read the budget from the environment, explicit arguments winning.
+
+        None of these is a secret -- they are three integers -- so unlike
+        :class:`~ai.config.AIConfig` there is nothing here to mask.
+        """
+        values: dict[str, object] = {
+            "max_items": _env_int(ENV_MAX_ITEMS, DEFAULT_MAX_ITEMS),
+            "max_chars": _env_int(ENV_MAX_CHARS, DEFAULT_MAX_CHARS),
+            "max_total_tokens": _env_int(ENV_MAX_TOKENS, DEFAULT_MAX_TOKENS),
+        }
+        values.update(overrides)
+        return cls(**values)  # type: ignore[arg-type]
+
+    def describe(self) -> str:
+        """One line naming the active limits, for a report footer."""
+        tokens = ("no token limit" if self.max_total_tokens is None
+                  else f"{self.max_total_tokens} est. tokens")
+        return f"{self.max_items} excerpts / {self.max_chars} chars / {tokens}"
+
+
+def _env_int(name: str, default: int | None) -> int | None:
+    """Read an integer environment variable, or return the default."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    text = raw.strip()
+    if text.lower() in ("none", "off", "unlimited"):
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} is not an integer") from exc
 
 
 class KnowledgeItem(BaseModel):
@@ -207,6 +327,62 @@ def _neutralise_fences(text: str) -> str:
     return _FENCE_PATTERN.sub(lambda m: " ".join("=" * len(m.group())), text)
 
 
+class ExcludedKnowledge(BaseModel):
+    """One retrieved chunk the budget could not afford.
+
+    Kept, not discarded.  A chunk that was retrieved and then dropped is a fact
+    about this run: it says the budget bound, which excerpts the model never
+    saw, and how close they were.  Silently losing that would make a thin
+    answer indistinguishable from a well-supported one.
+
+    Composition, as everywhere else -- the retrieved chunk is held whole rather
+    than copied field by field, so an excluded excerpt reports exactly the same
+    provenance an included one does.  It carries no ``[K#]`` label, and that is
+    deliberate: labels are only ever assigned to excerpts the model was given,
+    which is what keeps ``knowledge_refs`` checkable.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    retrieved: RetrievedChunk
+    reason: BudgetReason
+
+    @property
+    def chunk_id(self) -> str:
+        return self.retrieved.chunk_id
+
+    @property
+    def document_id(self) -> str:
+        return self.retrieved.document_id
+
+    @property
+    def section(self) -> str:
+        return self.retrieved.section
+
+    @property
+    def similarity(self) -> float:
+        return self.retrieved.similarity
+
+    @property
+    def rank(self) -> int:
+        """Its position in the retrieval ranking, which the label would have followed."""
+        return self.retrieved.rank
+
+    def citation(self) -> str:
+        return self.retrieved.citation()
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "chunk_id": self.chunk_id,
+            "document_id": self.document_id,
+            "section": self.section,
+            "citation": self.citation(),
+            "similarity": round(self.similarity, 6),
+            "retrieval_rank": self.rank,
+            "excluded_by": self.reason.value,
+        }
+
+
 class KnowledgeContext(BaseModel):
     """The reference block, its items, and what was left out of it."""
 
@@ -218,7 +394,16 @@ class KnowledgeContext(BaseModel):
         default=False, description="True when some retrieved chunks were dropped."
     )
     dropped_items: int = Field(default=0, ge=0)
-    total_chars: int = Field(default=0, ge=0, description="Characters of chunk text used.")
+    excluded: tuple[ExcludedKnowledge, ...] = Field(
+        default=(), description="Retrieved chunks the budget excluded, in rank order."
+    )
+    total_chars: int = Field(
+        default=0, ge=0, description="Rendered characters of the block that was built."
+    )
+    estimated_tokens: int = Field(
+        default=0, ge=0, description="Estimated tokens of the block. An estimate, not a count."
+    )
+    budget: str = Field(default="", description="The limits that were in force.")
     notes: tuple[str, ...] = ()
 
     @model_validator(mode="after")
@@ -230,6 +415,11 @@ class KnowledgeContext(BaseModel):
             raise ValueError("the same chunk appears twice in the context")
         if self.capped != (self.dropped_items > 0):
             raise ValueError("capped must be true exactly when items were dropped")
+        if self.dropped_items != len(self.excluded):
+            raise ValueError("dropped_items must match the recorded exclusions")
+        included = {item.chunk_id for item in self.items}
+        if included & {dropped.chunk_id for dropped in self.excluded}:
+            raise ValueError("a chunk cannot be both included and excluded")
         if self.items and not self.text:
             raise ValueError("a context with items must render to text")
         if self.text and not self.items:
@@ -247,6 +437,10 @@ class KnowledgeContext(BaseModel):
     def by_ref(self, ref: str) -> KnowledgeItem | None:
         return next((item for item in self.items if item.ref == ref), None)
 
+    def excluded_chunk_ids(self) -> tuple[str, ...]:
+        """Chunks retrieval found but the budget could not afford."""
+        return tuple(dropped.chunk_id for dropped in self.excluded)
+
     def cited(self, knowledge_refs: Sequence[str]) -> tuple[KnowledgeItem, ...]:
         """The items the model actually cited, in label order."""
         wanted = set(knowledge_refs)
@@ -257,6 +451,8 @@ class KnowledgeContext(BaseModel):
         payload = {
             "item_count": len(self.items),
             "total_chars": self.total_chars,
+            "estimated_tokens": self.estimated_tokens,
+            "budget": self.budget,
             "capped": self.capped,
             "dropped_items": self.dropped_items,
             "notes": list(self.notes),
@@ -264,79 +460,144 @@ class KnowledgeContext(BaseModel):
                 dict(item.metadata(), **({"text": item.text} if include_text else {}))
                 for item in self.items
             ],
+            "excluded": [dropped.metadata() for dropped in self.excluded],
         }
         return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
 
 
-#: An empty context, for the many paths where no knowledge is available.
-_EMPTY = KnowledgeContext()
+def _render_block(items: Sequence[KnowledgeItem]) -> str:
+    """Assemble the delimited block from already-selected items."""
+    body = "\n\n".join(item.render() for item in items)
+    return f"{KNOWLEDGE_BLOCK_START}\n{body}\n{KNOWLEDGE_BLOCK_END}"
+
+
+#: Characters the delimiters and the blank lines between excerpts add.
+_BLOCK_OVERHEAD: Final[int] = len(KNOWLEDGE_BLOCK_START) + len(KNOWLEDGE_BLOCK_END) + 2
 
 
 def build_knowledge_context(
     retrieval: RetrievalReport | None,
     config: KnowledgeContextConfig | None = None,
 ) -> KnowledgeContext:
-    """Render a retrieval result as the numbered reference block.
+    """Select, within budget, the excerpts a prompt will carry.
 
-    Items are taken **in retrieval order** and labelled by position.  Chunks
-    are included whole or not at all: when the character budget runs out the
-    remaining, lower-ranked chunks are dropped rather than truncated, because
-    half a section of security guidance is worse than none -- it reads as
-    complete and stops mid-argument.
+    Runs **after** retrieval has ranked everything and **before** the prompt is
+    built, so it changes what is affordable without touching what is relevant.
 
-    Deterministic: the same retrieval report always produces the same block,
-    byte for byte.
+    The policy, in order:
+
+    1. Walk the retrieved chunks in **retrieval rank order**. Nothing is
+       re-sorted, re-scored or sampled -- the highest-ranked chunk is always
+       considered first, and is always included if it fits.
+    2. Measure each candidate as it will actually be **rendered**: provenance
+       header plus text plus the separator. Budgeting the raw chunk text alone
+       understates the request by roughly 150 characters per excerpt, which is
+       exactly the error that lets an oversized request through.
+    3. Include it when it fits inside every active limit; otherwise record it
+       as :class:`ExcludedKnowledge` with the limit that stopped it, and
+       **carry on to the next chunk** -- a later, shorter excerpt may still
+       fit, and running out of room is not a reason to stop looking.
+    4. Never truncate. A half-excerpt reads as complete and stops mid-argument,
+       and its citation would point at text the reader cannot see. Excluding a
+       lower-ranked excerpt is always preferable to corrupting a citation.
+
+    The limits are hard. If even the first excerpt does not fit, none is
+    supplied and the run proceeds with no knowledge -- which the report states
+    plainly. That is the point: a budget that is exceeded when it matters is
+    not a budget, and a rejected request loses the analysis entirely rather
+    than degrading it.
+
+    Deterministic: same retrieval report and same config, same block, byte for
+    byte, including which excerpts were excluded and why.
     """
     cfg = config or KnowledgeContextConfig()
-
-    if retrieval is None or not retrieval.chunks:
-        return _EMPTY
+    chunks = list(retrieval.chunks) if retrieval is not None else []
 
     items: list[KnowledgeItem] = []
-    used_chars = 0
-    dropped = 0
-    dropped_for_chars = 0
+    excluded: list[ExcludedKnowledge] = []
+    used_chars = _BLOCK_OVERHEAD if chunks else 0
 
-    for chunk in retrieval.chunks:
-        if len(items) >= cfg.max_items:
-            dropped += 1
+    for chunk in chunks:
+        candidate = KnowledgeItem(ref=f"K{len(items) + 1}",
+                                  retrieved=_renumbered(chunk, len(items)))
+        # Size as rendered, including the blank line that will separate it
+        # from the previous excerpt.
+        size = len(candidate.render()) + (2 if items else 0)
+
+        reason = _rejection(cfg, len(items), used_chars, size)
+        if reason is not None:
+            excluded.append(ExcludedKnowledge(retrieved=chunk, reason=reason))
             continue
-        if used_chars + len(chunk.text) > cfg.max_chars and items:
-            # Keep going rather than break: a later, shorter chunk may still
-            # fit, and dropping by size is not a reason to drop by rank too.
-            dropped += 1
-            dropped_for_chars += 1
-            continue
-        items.append(KnowledgeItem(ref=f"K{len(items) + 1}",
-                                   retrieved=_renumbered(chunk, len(items))))
-        used_chars += len(chunk.text)
+
+        items.append(candidate)
+        used_chars += size
 
     if not items:
-        return _EMPTY
+        text = ""
+        estimated = 0
+    else:
+        text = _render_block(items)
+        used_chars = len(text)
+        estimated = estimate_tokens(text)
 
-    notes: list[str] = []
-    if dropped:
-        notes.append(
-            f"{dropped} retrieved chunk(s) were not included: the prompt limit is "
-            f"{cfg.max_items} excerpts and {cfg.max_chars} characters."
-        )
-    if dropped_for_chars:
-        notes.append(
-            f"{dropped_for_chars} chunk(s) were dropped whole to stay within the "
-            "character budget; no excerpt was truncated."
-        )
-
-    body = "\n\n".join(item.render() for item in items)
-    text = f"{KNOWLEDGE_BLOCK_START}\n{body}\n{KNOWLEDGE_BLOCK_END}"
+    notes = _budget_notes(cfg, items, excluded)
 
     return KnowledgeContext(
         items=tuple(items),
         text=text,
-        capped=dropped > 0,
-        dropped_items=dropped,
-        total_chars=used_chars,
+        capped=bool(excluded),
+        dropped_items=len(excluded),
+        excluded=tuple(excluded),
+        total_chars=used_chars if items else 0,
+        estimated_tokens=estimated,
+        budget=cfg.describe(),
         notes=tuple(notes),
     )
+
+
+def _rejection(
+    cfg: KnowledgeContextConfig, included: int, used_chars: int, size: int
+) -> BudgetReason | None:
+    """Which limit, if any, this candidate would break.
+
+    Checked in declaration order so the reported reason is stable: a chunk that
+    breaks both the item count and the character budget is always reported
+    against the item count.
+    """
+    if included >= cfg.max_items:
+        return BudgetReason.MAX_ITEMS
+    if used_chars + size > cfg.max_chars:
+        return BudgetReason.MAX_CHARS
+    if (cfg.max_total_tokens is not None
+            and _tokens_for(used_chars + size) > cfg.max_total_tokens):
+        return BudgetReason.MAX_TOKENS
+    return None
+
+
+def _budget_notes(
+    cfg: KnowledgeContextConfig,
+    items: Sequence[KnowledgeItem],
+    excluded: Sequence[ExcludedKnowledge],
+) -> list[str]:
+    """Human-readable disclosure of what the budget did."""
+    if not excluded:
+        return []
+
+    counts: dict[str, int] = {}
+    for dropped in excluded:
+        counts[dropped.reason.value] = counts.get(dropped.reason.value, 0) + 1
+    breakdown = ", ".join(f"{count} by {name}" for name, count in sorted(counts.items()))
+
+    notes = [
+        f"{len(excluded)} retrieved excerpt(s) were excluded by the context budget "
+        f"({cfg.describe()}): {breakdown}. No excerpt was truncated."
+    ]
+    if not items:
+        notes.append(
+            "Nothing fitted the budget, so no reference knowledge was supplied. "
+            "Raise DPI_RAG_MAX_CHARS or DPI_RAG_MAX_ITEMS to include some."
+        )
+    return notes
 
 
 def _renumbered(chunk: RetrievedChunk, position: int) -> RetrievedChunk:

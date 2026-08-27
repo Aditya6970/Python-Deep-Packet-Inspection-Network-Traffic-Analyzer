@@ -49,6 +49,9 @@ Options:
   --no-ai                Run DPI only; skip the AI layer entirely
   --no-rag               Skip knowledge retrieval; send the capture alone
   --show-knowledge       Print the retrieved reference excerpts, then continue
+  --rag-max-items <n>    Most reference excerpts to send   (default 4)
+  --rag-max-chars <n>    Character ceiling on the excerpts (default 3000)
+  --rag-max-tokens <n>   Estimated-token ceiling, or "none" (default 900)
   --show-payload         Print the exact JSON that would be sent, then exit
 
 Retrieval (RAG):
@@ -58,8 +61,15 @@ Retrieval (RAG):
   If they are missing, or the embedding model cannot be loaded, the analysis
   still runs -- without knowledge, and the report says so.
 
+  Retrieved excerpts are budgeted before the prompt is built, so an oversized
+  request cannot be sent. Excerpts that do not fit are excluded whole -- never
+  truncated -- and the report lists them. Capture data is never budgeted away.
+
 Environment:
   DPI_LLM_PROVIDER       groq (default) | ollama | openai
+  DPI_RAG_MAX_ITEMS      Reference excerpts per request (default 4)
+  DPI_RAG_MAX_CHARS      Character ceiling on those excerpts (default 3000)
+  DPI_RAG_MAX_TOKENS     Estimated-token ceiling, or "none" (default 900)
   GROQ_API_KEY           Required when provider is groq.  Free tier available.
   OLLAMA_BASE_URL        Default http://localhost:11434/v1 .  No key needed.
   OPENAI_API_KEY         Required when provider is openai.
@@ -96,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     use_ai = True
     use_rag = True
     show_knowledge = False
+    rag_budget: dict[str, object] = {}
     show_payload = False
     block_ips: list[str] = []
     block_apps: list[str] = []
@@ -130,6 +141,16 @@ def main(argv: list[str] | None = None) -> int:
             i += 1; provider = argv[i]
         elif arg == "--no-ai":
             use_ai = False
+        elif arg == "--rag-max-items" and i + 1 < argc:
+            i += 1; rag_budget["max_items"] = int(argv[i])
+        elif arg == "--rag-max-chars" and i + 1 < argc:
+            i += 1; rag_budget["max_chars"] = int(argv[i])
+        elif arg == "--rag-max-tokens" and i + 1 < argc:
+            i += 1
+            rag_budget["max_total_tokens"] = (
+                None if argv[i].strip().lower() in ("none", "off", "unlimited")
+                else int(argv[i])
+            )
         elif arg == "--no-rag":
             use_rag = False
         elif arg == "--show-knowledge":
@@ -213,7 +234,16 @@ def main(argv: list[str] | None = None) -> int:
             print("Install the optional RAG dependencies with: "
                   "pip install -r requirements-rag.txt")
         else:
-            pipeline = default_pipeline()
+            # The budget comes from the environment, with any flag overriding
+            # it.  Nothing provider-specific is involved: the limits are
+            # excerpts, characters and estimated tokens.
+            if rag_budget:
+                from ai.rag.context import KnowledgeContextConfig
+
+                pipeline = default_pipeline(
+                    context_config=KnowledgeContextConfig.from_env(**rag_budget))
+            else:
+                pipeline = default_pipeline()
 
     if show_payload:
         from ai.extractor import build_capture_report
@@ -262,6 +292,13 @@ def main(argv: list[str] | None = None) -> int:
                 item.metadata() for item in outcome.knowledge.items
             ] if outcome.knowledge is not None else [],
             "knowledge_cited": list(outcome.knowledge_refs()),
+            "knowledge_excluded": [
+                dropped.metadata() for dropped in outcome.knowledge.excluded
+            ] if outcome.knowledge is not None else [],
+            "knowledge_budget": (outcome.knowledge.budget
+                                 if outcome.knowledge is not None else ""),
+            "knowledge_estimated_tokens": (outcome.knowledge.estimated_tokens
+                                           if outcome.knowledge is not None else 0),
             "analysis": outcome.analysis.model_dump(mode="json"),
         }
         Path(json_file).write_text(

@@ -112,11 +112,25 @@ class RAGOutcome:
             return None
         return self.context.text
 
+    @property
+    def excluded_count(self) -> int:
+        """Retrieved excerpts the context budget could not afford."""
+        return self.context.dropped_items if self.context is not None else 0
+
     def describe(self) -> str:
         """One line explaining the status, for a report or the console."""
         if self.status is RAGStatus.USED:
             count = len(self.context.items) if self.context else 0
-            return f"{count} reference excerpt(s) supplied to the model."
+            supplied = f"{count} reference excerpt(s) supplied to the model."
+            if self.excluded_count:
+                return (f"{supplied} {self.excluded_count} more were retrieved but "
+                        "excluded by the context budget.")
+            return supplied
+        if self.status is RAGStatus.NO_KNOWLEDGE and self.excluded_count:
+            # "Nothing matched" and "nothing fitted" are different facts, and
+            # only one of them is about the corpus.
+            return (f"{self.excluded_count} excerpt(s) were retrieved but none fitted "
+                    "the context budget, so no knowledge was supplied.")
         return self.detail or _DEFAULT_DETAIL.get(self.status, "Knowledge was not used.")
 
 
@@ -346,9 +360,22 @@ class KnowledgePipeline:
 
 
 def default_pipeline(**overrides: Any) -> KnowledgePipeline:
-    """A pipeline with project defaults.
+    """A pipeline with project defaults, including the environment's budget.
 
     A function rather than a module-level instance, so nothing is built at
     import time and two callers cannot accidentally share one index.
+
+    The context budget is read from the environment unless the caller supplies
+    one, so ``DPI_RAG_MAX_CHARS`` and friends work without any code change.
+    The import is deferred like every other RAG import here: a machine without
+    the optional dependencies still gets a usable pipeline object, which then
+    reports ``dependency_missing`` rather than failing to construct.
     """
+    if "context_config" not in overrides:
+        try:
+            from .context import KnowledgeContextConfig
+        except ImportError:  # pragma: no cover - numpy/pydantic absent
+            pass
+        else:
+            overrides["context_config"] = KnowledgeContextConfig.from_env()
     return KnowledgePipeline(**overrides)

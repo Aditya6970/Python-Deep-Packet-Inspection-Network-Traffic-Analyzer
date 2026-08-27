@@ -64,6 +64,9 @@ from ai.rag.chunking import chunk_corpus, chunk_document
 from ai.rag.context import (
     KNOWLEDGE_BLOCK_END,
     KNOWLEDGE_BLOCK_START,
+    BudgetReason,
+    ExcludedKnowledge,
+    estimate_tokens,
     KnowledgeContext,
     KnowledgeContextConfig,
     KnowledgeItem,
@@ -396,11 +399,12 @@ def test_prompt() -> None:
     capped = fixture_context(max_items=1)
     check("max_items caps the number of excerpts", len(capped.items) == 1)
     check("capping is recorded", capped.capped and capped.dropped_items > 0)
-    check("capping is explained in the notes", any("prompt limit" in n for n in capped.notes),
-          str(capped.notes))
+    check("capping is explained in the notes",
+          any("context budget" in n for n in capped.notes), str(capped.notes))
     tiny = fixture_context(max_chars=1)
-    check("a tiny character budget still yields one whole excerpt",
-          len(tiny.items) == 1, str(len(tiny.items)))
+    check("a budget nothing can fit supplies nothing rather than overflowing",
+          len(tiny.items) == 0, str(len(tiny.items)))
+    check("everything excluded is still disclosed", tiny.dropped_items > 0)
     check("no excerpt is ever truncated mid-text",
           all(item.text in tiny.text for item in tiny.items))
     check("an empty retrieval yields an empty context",
@@ -423,6 +427,253 @@ def test_prompt() -> None:
            lambda: KnowledgeItem(ref="K1", retrieved=context.items[0].retrieved,
                                  extra="value"))
     check("items are immutable", KnowledgeItem.model_config["frozen"] is True)
+
+
+# ===========================================================================
+# A2. Context budget
+# ===========================================================================
+def test_budget() -> None:
+    print("\nA2. Context budget")
+
+    outcome = fixture_pipeline().build_context(mixed_capture())
+    retrieval = outcome.retrieval_report
+    assert retrieval is not None
+    ranked = list(retrieval.chunks)
+    check("the fixture retrieves enough to budget against", len(ranked) >= 4,
+          str(len(ranked)))
+
+    generous = build_knowledge_context(
+        retrieval, KnowledgeContextConfig(max_items=99, max_chars=10**6,
+                                          max_total_tokens=None))
+    check("an unrestrictive budget changes nothing",
+          len(generous.items) == len(ranked))
+    check("an unrestrictive budget excludes nothing",
+          generous.dropped_items == 0 and generous.excluded == ())
+    check("an unrestrictive budget is not marked capped", generous.capped is False)
+
+    # -- rank order is what selection follows ------------------------------
+    for limit in (1, 2, 3):
+        trimmed = build_knowledge_context(retrieval,
+                                          KnowledgeContextConfig(max_items=limit))
+        check(f"max_items={limit} keeps exactly the top {limit}",
+              [item.chunk_id for item in trimmed.items]
+              == [c.chunk_id for c in ranked[:limit]],
+              str([item.chunk_id for item in trimmed.items]))
+        check(f"max_items={limit} excludes exactly the rest",
+              [d.chunk_id for d in trimmed.excluded]
+              == [c.chunk_id for c in ranked[limit:]])
+        check(f"max_items={limit} relabels K1..K{limit} contiguously",
+              [item.ref for item in trimmed.items]
+              == [f"K{i + 1}" for i in range(limit)])
+        check(f"max_items={limit} names the limit that bound",
+              all(d.reason.value == "max_items" for d in trimmed.excluded))
+
+    check("the highest-ranked excerpt is never the one dropped",
+          build_knowledge_context(retrieval,
+                                  KnowledgeContextConfig(max_items=1)
+                                  ).items[0].chunk_id == ranked[0].chunk_id)
+
+    # -- character budget --------------------------------------------------
+    sizes = [len(build_knowledge_context(
+        retrieval, KnowledgeContextConfig(max_items=n, max_chars=10**6,
+                                          max_total_tokens=None)).text)
+        for n in (1, 2, 3)]
+    two_fit = sizes[1]
+    char_capped = build_knowledge_context(
+        retrieval, KnowledgeContextConfig(max_chars=two_fit, max_total_tokens=None))
+    check("max_chars admits everything that fits", len(char_capped.items) >= 2,
+          str(len(char_capped.items)))
+    check("the rendered block never exceeds max_chars",
+          len(char_capped.text) <= two_fit, f"{len(char_capped.text)} > {two_fit}")
+    check("the character budget reports its reason",
+          all(d.reason.value == "max_chars" for d in char_capped.excluded),
+          str([d.reason.value for d in char_capped.excluded]))
+    check("total_chars matches the block that was built",
+          char_capped.total_chars == len(char_capped.text))
+
+    # The guarantee that matters: never over budget, for any budget.
+    holds = True
+    for limit in range(0, 2500, 97):
+        built = build_knowledge_context(
+            retrieval, KnowledgeContextConfig(max_chars=limit, max_items=99,
+                                              max_total_tokens=None))
+        if len(built.text) > limit:
+            holds = False
+            break
+    check("no character budget is ever exceeded, at any size", holds)
+
+    # -- token budget ------------------------------------------------------
+    check("the token estimate grows with length",
+          estimate_tokens("x" * 350) == 100 and estimate_tokens("") == 0,
+          str(estimate_tokens("x" * 350)))
+    token_capped = build_knowledge_context(
+        retrieval, KnowledgeContextConfig(max_items=99, max_chars=10**6,
+                                          max_total_tokens=100))
+    check("a token ceiling bounds the block",
+          token_capped.estimated_tokens <= 100, str(token_capped.estimated_tokens))
+    check("the token budget reports its own reason",
+          all(d.reason.value == "max_total_tokens" for d in token_capped.excluded),
+          str([d.reason.value for d in token_capped.excluded]))
+    check("a token ceiling of None disables that check",
+          build_knowledge_context(
+              retrieval, KnowledgeContextConfig(max_items=99, max_chars=10**6,
+                                                max_total_tokens=None)
+          ).dropped_items == 0)
+
+    # -- exclusion, never truncation ---------------------------------------
+    partial = build_knowledge_context(retrieval,
+                                      KnowledgeContextConfig(max_chars=two_fit,
+                                                             max_total_tokens=None))
+    for item in partial.items:
+        check(f"{item.ref}: the excerpt is whole",
+              item.text in partial.text and item.chunk.text == item.text)
+    excluded_ids = set(partial.excluded_chunk_ids())
+    check("an excerpt that would overflow is excluded, not shortened",
+          excluded_ids != set())
+    check("no excluded excerpt leaves a fragment behind",
+          all(next(c for c in ranked if c.chunk_id == cid).text not in partial.text
+              for cid in excluded_ids))
+    check("included and excluded never overlap",
+          not (excluded_ids & {i.chunk_id for i in partial.items}))
+    check("every retrieved chunk is either included or disclosed",
+          len(partial.items) + partial.dropped_items == len(ranked))
+
+    # -- disclosure --------------------------------------------------------
+    for dropped in partial.excluded:
+        meta = dropped.metadata()
+        ok = (meta["chunk_id"] and meta["document_id"] and meta["section"]
+              and meta["citation"] and meta["excluded_by"]
+              and isinstance(meta["retrieval_rank"], int))
+        check(f"excluded {dropped.citation()}: provenance is disclosed", bool(ok))
+    check("an excluded excerpt carries no K label",
+          "ref" not in partial.excluded[0].metadata())
+    check("the budget in force is recorded",
+          "chars" in partial.budget and partial.budget == KnowledgeContextConfig(
+              max_chars=two_fit, max_total_tokens=None).describe())
+    check("exclusions appear in the serialised context",
+          len(json.loads(partial.to_json())["excluded"]) == partial.dropped_items)
+    check("the serialised context records the estimate and the budget",
+          json.loads(partial.to_json())["estimated_tokens"] == partial.estimated_tokens
+          and json.loads(partial.to_json())["budget"] == partial.budget)
+
+    # -- determinism -------------------------------------------------------
+    again = build_knowledge_context(retrieval,
+                                    KnowledgeContextConfig(max_chars=two_fit,
+                                                           max_total_tokens=None))
+    check("budgeted selection is deterministic",
+          [i.chunk_id for i in again.items] == [i.chunk_id for i in partial.items])
+    check("budgeted exclusion is deterministic",
+          again.excluded_chunk_ids() == partial.excluded_chunk_ids())
+    check("budgeted output is byte-identical", again.text == partial.text)
+    check("budgeted metadata is byte-identical", again.to_json() == partial.to_json())
+
+    # -- the prompt actually shrinks ---------------------------------------
+    report = mixed_capture()
+    unbounded = build_knowledge_context(
+        retrieval, KnowledgeContextConfig(max_items=99, max_chars=10**6,
+                                          max_total_tokens=None))
+    bounded = build_knowledge_context(retrieval, KnowledgeContextConfig(max_items=1))
+    big = build_messages(report, None, unbounded.text)
+    small = build_messages(report, None, bounded.text)
+    big_chars = sum(len(m["content"]) for m in big)
+    small_chars = sum(len(m["content"]) for m in small)
+    check("the budgeted prompt is materially smaller", small_chars < big_chars,
+          f"{small_chars} vs {big_chars}")
+    check("the saving comes from the knowledge block alone",
+          big_chars - small_chars == len(unbounded.text) - len(bounded.text),
+          f"{big_chars - small_chars} vs {len(unbounded.text) - len(bounded.text)}")
+    check("the capture data is byte-identical in both prompts",
+          big[1]["content"].split("BEGIN CAPTURE DATA")[1]
+          == small[1]["content"].split("BEGIN CAPTURE DATA")[1])
+    check("the system message is identical in both prompts",
+          big[0]["content"] == small[0]["content"])
+
+    # -- DPI facts are never budgeted --------------------------------------
+    def capture_json(message: str) -> str:
+        """The JSON between the capture delimiters, and nothing else."""
+        return message.split("===== BEGIN CAPTURE DATA =====")[1].split(
+            "===== END CAPTURE DATA =====")[0]
+
+    plain = build_messages(report, None, None)
+    check("the capture JSON is byte-identical with and without knowledge",
+          capture_json(plain[1]["content"]) == capture_json(small[1]["content"]))
+    check("the capture JSON is byte-identical at every budget",
+          capture_json(big[1]["content"]) == capture_json(small[1]["content"]))
+    for limit in (0, 1, 99):
+        built = build_knowledge_context(retrieval,
+                                        KnowledgeContextConfig(max_items=limit))
+        messages = build_messages(report, None, built.text or None)
+        check(f"max_items={limit} leaves every flow in the prompt",
+              all(f'"flow_id": {f.flow_id}' in messages[1]["content"]
+                  for f in report.flows))
+
+    # -- zero budgets and empty retrieval ----------------------------------
+    zero = build_knowledge_context(retrieval, KnowledgeContextConfig(max_items=0))
+    check("max_items=0 supplies nothing", zero.items == () and zero.text == "")
+    check("max_items=0 still discloses everything it dropped",
+          zero.dropped_items == len(ranked))
+    check("max_items=0 explains that nothing fitted",
+          any("no reference knowledge was supplied" in n for n in zero.notes),
+          str(zero.notes))
+    check("an empty retrieval stays graceful",
+          build_knowledge_context(None).items == ()
+          and build_knowledge_context(None).excluded == ())
+    check("an empty retrieval is not reported as capped",
+          build_knowledge_context(None).capped is False)
+
+    # -- configuration -----------------------------------------------------
+    check("the default budget is conservative",
+          (KnowledgeContextConfig().max_items, KnowledgeContextConfig().max_chars,
+           KnowledgeContextConfig().max_total_tokens) == (4, 3000, 900))
+    saved = {name: os.environ.get(name)
+             for name in ("DPI_RAG_MAX_ITEMS", "DPI_RAG_MAX_CHARS", "DPI_RAG_MAX_TOKENS")}
+    try:
+        os.environ["DPI_RAG_MAX_ITEMS"] = "2"
+        os.environ["DPI_RAG_MAX_CHARS"] = "1500"
+        os.environ["DPI_RAG_MAX_TOKENS"] = "none"
+        from_env = KnowledgeContextConfig.from_env()
+        check("the budget is configurable from the environment",
+              (from_env.max_items, from_env.max_chars, from_env.max_total_tokens)
+              == (2, 1500, None))
+        check("an explicit argument beats the environment",
+              KnowledgeContextConfig.from_env(max_items=5).max_items == 5)
+        os.environ["DPI_RAG_MAX_ITEMS"] = "not-a-number"
+        raises("a malformed budget in the environment is rejected", ValueError,
+               KnowledgeContextConfig.from_env)
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    raises("a negative max_items is rejected", ValueError,
+           lambda: KnowledgeContextConfig(max_items=-1))
+    raises("a negative max_total_tokens is rejected", ValueError,
+           lambda: KnowledgeContextConfig(max_total_tokens=-1))
+
+    # -- nothing provider-specific ----------------------------------------
+    source = Path("ai/rag/context.py").read_text(encoding="utf-8")
+    for banned in ("groq", "openai", "ollama"):
+        check(f"the budget layer never mentions {banned!r}", banned not in source.lower())
+    check("the budget layer adds no tokenizer dependency",
+          "import tiktoken" not in source and "from tiktoken" not in source)
+    check("the budget layer imports nothing heavy",
+          "import numpy" not in source and "import torch" not in source)
+
+    # -- privacy holds through the new layer -------------------------------
+    os.environ["DPI_BUDGET_TEST_SECRET"] = "sk-must-never-appear"
+    try:
+        rendered = json.dumps([partial.to_json(include_text=True),
+                               [d.metadata() for d in partial.excluded]])
+        check("no secret leaks through the budget layer",
+              "sk-must-never-appear" not in rendered)
+    finally:
+        os.environ.pop("DPI_BUDGET_TEST_SECRET", None)
+    check("no address leaks through the budget layer", not IPV4.search(rendered))
+    check("no capture hostname leaks through the budget layer",
+          not any(f"unique{i}.example.com" in rendered for i in range(8)))
+    check("excluded metadata carries no chunk text",
+          all("text" not in d.metadata() for d in partial.excluded))
 
 
 # ===========================================================================
@@ -860,7 +1111,9 @@ def test_reporting() -> None:
     check("it marks the uncited excerpts", "not cited" in text)
     check("it states what the model cited", "Cited by the model: K1" in text)
     check("the footer distinguishes supplied from cited",
-          "supplied," in text and "cited]" in text)
+          "supplied," in text and "cited," in text)
+    check("the footer reports the estimated knowledge size",
+          "est. tokens]" in text, text.splitlines()[-1])
 
     uncited = analyze_with(report, fixture_pipeline(),
                            FakeLLMClient(response=sample_analysis()))
@@ -983,6 +1236,7 @@ def main() -> int:
     print("RAG step 7 -- knowledge-grounded analysis")
 
     test_prompt()
+    test_budget()
     test_citations()
     test_fact_boundary()
     test_injection()

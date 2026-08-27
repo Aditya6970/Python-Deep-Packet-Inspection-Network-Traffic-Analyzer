@@ -296,8 +296,11 @@ def _rag_fields(outcome: "RAGOutcome | None") -> dict[str, object]:
     """
     if outcome is None:
         return {}
+    # The context is attached even when it supplied nothing, because an empty
+    # context still records what the budget excluded.  ``knowledge_used`` keys
+    # off the items, so nothing downstream mistakes "excluded" for "supplied".
     return {
-        "knowledge": outcome.context if outcome.used else None,
+        "knowledge": outcome.context,
         "rag_status": outcome.status.value,
         "rag_detail": outcome.describe(),
         "signal_types": outcome.signal_types,

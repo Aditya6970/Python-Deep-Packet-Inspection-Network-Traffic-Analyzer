@@ -53,6 +53,29 @@ def _bullets(items: list[str], marker: str = "-") -> list[str]:
     return out or ["  (none)"]
 
 
+def _render_excluded(outcome: AnalysisOutcome) -> list[str]:
+    """List the excerpts retrieval found but the context budget could not fit.
+
+    Disclosed rather than dropped.  Knowing that three higher-effort excerpts
+    existed and were left out is the difference between "the corpus had nothing
+    to say" and "the budget was too tight", and only one of those is fixed by
+    editing the corpus.
+    """
+    knowledge = outcome.knowledge
+    if knowledge is None or not knowledge.excluded:
+        return []
+
+    lines = ["", "KNOWLEDGE EXCLUDED  (retrieved, but over the context budget)"]
+    for dropped in knowledge.excluded:
+        lines.append(f"  [--] {dropped.citation()}")
+        lines.append(
+            f"       similarity: {dropped.similarity:.2f}   "
+            f"excluded by: {dropped.reason.value}"
+        )
+    lines.append(f"  Budget in force: {knowledge.budget}")
+    return lines
+
+
 def render_knowledge(outcome: AnalysisOutcome) -> list[str]:
     """Render what retrieval supplied, and what the model did with it.
 
@@ -75,7 +98,9 @@ def render_knowledge(outcome: AnalysisOutcome) -> list[str]:
         if status == "disabled":
             return []
         detail = outcome.rag_detail or "Reference knowledge was not used."
-        return ["", "KNOWLEDGE  (none used)"] + _wrap(f"{status}: {detail}")
+        lines = ["", "KNOWLEDGE  (none used)"] + _wrap(f"{status}: {detail}")
+        lines.extend(_render_excluded(outcome))
+        return lines
 
     knowledge = outcome.knowledge
     assert knowledge is not None  # knowledge_used guarantees this
@@ -102,6 +127,8 @@ def render_knowledge(outcome: AnalysisOutcome) -> list[str]:
         lines.append(
             "  Cited by the model: none  (the excerpts did not change the assessment)"
         )
+
+    lines.extend(_render_excluded(outcome))
 
     for note in knowledge.notes:
         lines.extend(_wrap(note, indent="  "))
@@ -196,12 +223,16 @@ def render_analysis(outcome: AnalysisOutcome) -> str:
         lines.extend(_bullets(r.notes))
 
     lines.append("")
-    knowledge_note = (
-        f"knowledge: {len(outcome.knowledge.items)} supplied, "
-        f"{len(outcome.knowledge_refs())} cited"
-        if outcome.knowledge_used and outcome.knowledge is not None
-        else f"knowledge: {outcome.rag_status}"
-    )
+    if outcome.knowledge_used and outcome.knowledge is not None:
+        knowledge_note = (
+            f"knowledge: {len(outcome.knowledge.items)} supplied, "
+            f"{len(outcome.knowledge_refs())} cited, "
+            f"~{outcome.knowledge.estimated_tokens} est. tokens"
+        )
+        if outcome.knowledge.dropped_items:
+            knowledge_note += f", {outcome.knowledge.dropped_items} over budget"
+    else:
+        knowledge_note = f"knowledge: {outcome.rag_status}"
     lines.append(
         f"[provider {outcome.provider or '?'} | prompt v{outcome.prompt_version} | "
         f"schema v{a.schema_version} | {outcome.attempts} attempt(s) | "
