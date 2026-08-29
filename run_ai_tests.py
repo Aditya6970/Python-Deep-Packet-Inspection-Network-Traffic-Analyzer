@@ -474,9 +474,13 @@ def test_client_and_analyzer() -> None:
               "APIConnectionError" in connection, connection)
         check("a non-status exception leaks nothing", SECRET not in connection)
 
-        # Classification is unchanged by the new detail.
-        check("a 413 still classifies as api_error",
-              OpenAIClient._classify(status_error)[0] is FailureReason.API_ERROR)
+        # Step 9 gave 413 its own reason: "the request was too big" is a
+        # specific, actionable cause, and reporting it as a generic API error
+        # invited a retry that could never work.
+        check("a 413 classifies as request_too_large",
+              OpenAIClient._classify(status_error)[0]
+              is FailureReason.REQUEST_TOO_LARGE,
+              str(OpenAIClient._classify(status_error)[0]))
         check("a 413 is still not retried", OpenAIClient._classify(status_error)[1] is False)
 
         # And the detail reaches LLMResult through the normal retry loop.
@@ -490,8 +494,9 @@ def test_client_and_analyzer() -> None:
         check("the failure detail reaches LLMResult",
               "HTTP 413" in live_like.detail and "code=rate_limit_exceeded" in live_like.detail,
               live_like.detail)
-        check("the failure reason is unchanged",
-              live_like.failure is FailureReason.API_ERROR, str(live_like.failure))
+        check("the failure reason names the size, not a generic API error",
+              live_like.failure is FailureReason.REQUEST_TOO_LARGE,
+              str(live_like.failure))
         check("the LLMResult detail carries no key", SECRET not in live_like.detail)
         degraded = analyze_capture(snap, "test_dpi.pcap", cfg, client=failing)
         check("graceful degradation is unchanged",

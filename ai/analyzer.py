@@ -66,6 +66,11 @@ _FAILURE_HELP: dict[FailureReason, str] = {
         "endpoint is actually up before raising DPI_AI_TIMEOUT."
     ),
     FailureReason.API_ERROR: "The API call failed. This is usually transient.",
+    FailureReason.REQUEST_TOO_LARGE: (
+        "The request was larger than this provider will accept in one call, so "
+        "it was not sent. Send less: fewer reference excerpts, a smaller "
+        "knowledge budget, or fewer flows."
+    ),
     FailureReason.INVALID_RESPONSE: (
         "The model's response did not match the expected schema."
     ),
@@ -101,6 +106,12 @@ def explain_failure(
     # port (APIConnectionError -> PROVIDER_UNAVAILABLE) while Windows silently
     # drops it (APITimeoutError -> TIMEOUT).  The classification stays honest
     # in both cases; only the advice is made actionable.
+    # An oversized request needs the provider's *size* advice, not its setup
+    # steps: the key is fine, the endpoint is fine, and the only useful thing
+    # to say is which knob makes the request smaller.
+    if reason is FailureReason.REQUEST_TOO_LARGE:
+        hint = spec.oversize_hint or spec.setup_hint
+        return f"{base}\n  Provider: {spec.label} ({config.model})\n  {hint}"
     if reason in (FailureReason.PROVIDER_UNAVAILABLE, FailureReason.AUTH_FAILED,
                   FailureReason.API_ERROR, FailureReason.TIMEOUT):
         return f"{base}\n  Provider: {spec.label} ({config.model})\n  {spec.setup_hint}"
@@ -223,7 +234,7 @@ def analyze_capture(
         if cfg.spec.structured_mode is StructuredMode.JSON_OBJECT
         else None
     )
-    messages = build_messages(report, schema, knowledge_text)
+    messages = build_messages(report, schema, knowledge_text, cfg.capture_format)
     result = llm.complete_structured(messages, AnalysisResult)
 
     if not result.ok or not isinstance(result.parsed, AnalysisResult):
@@ -235,7 +246,7 @@ def analyze_capture(
             provider=result.provider or cfg.provider.value,
             config=cfg,
             attempts=result.attempts,
-            prompt_version=prompt_version(bool(knowledge_text)),
+            prompt_version=prompt_version(bool(knowledge_text), cfg.capture_format),
             elapsed_seconds=time.monotonic() - started,
             **_rag_fields(rag_outcome),
         )
@@ -260,7 +271,7 @@ def analyze_capture(
             provider=result.provider or cfg.provider.value,
             config=cfg,
             attempts=result.attempts,
-            prompt_version=prompt_version(bool(knowledge_text)),
+            prompt_version=prompt_version(bool(knowledge_text), cfg.capture_format),
             elapsed_seconds=time.monotonic() - started,
             **_rag_fields(rag_outcome),
         )
@@ -282,7 +293,7 @@ def analyze_capture(
         provider=result.provider or cfg.provider.value,
         config=cfg,
         attempts=result.attempts,
-        prompt_version=prompt_version(bool(knowledge_text)),
+        prompt_version=prompt_version(bool(knowledge_text), cfg.capture_format),
         elapsed_seconds=time.monotonic() - started,
         **_rag_fields(rag_outcome),
     )

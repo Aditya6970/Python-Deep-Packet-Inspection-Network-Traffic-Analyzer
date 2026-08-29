@@ -40,6 +40,16 @@ from ai.rag.retrieval import RetrievalConfig
 from ai.rag.signals import extract_signals
 from ai.rag.vector_store import VectorRecord, VectorStore
 from ai.schemas import AnalysisResult
+from evaluation.candidates import (
+    CANDIDATES,
+    OBSERVED_FAILING_PROMPT_TOKENS,
+    Candidate,
+    CandidateAccount,
+    CaseAccount,
+    assess,
+    by_name,
+    rank,
+)
 from evaluation.cases import CASES, CORPUS_DOCUMENT_IDS, EvaluationCase, cases_for_live
 from evaluation.metrics import (
     MetricSummary,
@@ -644,19 +654,561 @@ def test_output() -> None:
     
     # -- isolation ---------------------------------------------------------
     source = Path("run_rag_evaluation.py").read_text(encoding="utf-8")
-    check("the harness never writes to the corpus",
-          "write_text" not in source and "open(" not in source)
-    for package in ("dpi/dpi_engine.py", "ai/analyzer.py", "ai/rag/retrieval.py"):
+    # What this is protecting is the corpus: an evaluation that can edit the
+    # thing it is measuring cannot be trusted.  It used to be enforced by
+    # banning the substring "open(" outright, which was a proxy that stopped
+    # being true the moment --out gave the harness one legitimate file to
+    # write.  Banning the proxy would have meant either deleting the feature or
+    # deleting the check, so the check now states the actual rule.
+    check("the harness never opens a path under knowledge/",
+          not re.search(r"open\([^)]*knowledge", source))
+    check("the harness never rewrites a file in place",
+          ".write_text(" not in source and "shutil" not in source)
+    write_opens = re.findall(r'open\([^\n]*["\']w["\']', source)
+    check("the harness opens exactly one file for writing", len(write_opens) == 1,
+          str(write_opens))
+    emit = source[source.index("def _emit("):source.index("def _failure_document(")]
+    check("and it is the file --out names, nothing else",
+          'open(path, "w", encoding="utf-8"' in emit)
+    check("the one write is UTF-8 without a BOM",
+          "utf-8-sig" not in source and 'encoding="utf-8"' in emit)
+    # The dependency direction, checked on import statements rather than on the
+    # word "evaluation" appearing anywhere in the file.  The substring version
+    # of this check was passing for the wrong reason: it needed a growing list
+    # of exemptions for ordinary prose, and a comment mentioning the evaluation
+    # step failed it while `import evaluation.cases as e` would have slipped
+    # through the exemptions.  An import is what must not exist, so an import
+    # is what is looked for.
+    import_pattern = re.compile(
+        r"^\s*(?:from\s+(?:\.*)evaluation[\s.]|import\s+evaluation\b)", re.MULTILINE)
+    for package in ("dpi/dpi_engine.py", "ai/analyzer.py", "ai/rag/retrieval.py",
+                    "ai/rag/pipeline.py", "ai/prompts.py"):
         text = Path(package).read_text(encoding="utf-8")
+        found = import_pattern.findall(text)
         check(f"{package} does not import the evaluation harness",
-              "evaluation" not in text.replace("evaluation step", "").replace(
-                  "evaluation)", "").replace("evaluation.", ""))
+              not found, str(found))
+    check("the isolation check would actually catch an import",
+          bool(import_pattern.search("from evaluation.cases import CASES"))
+          and bool(import_pattern.search("import evaluation"))
+          and not import_pattern.search("# the evaluation step measures this"))
+
+
+# ===========================================================================
+# Step 10 -- candidate accounting and the selection rule
+# ===========================================================================
+def account(name: str = "x", *, retrieved=("a", "b"), supplied=("a",),
+            relevant=("a", "b"), irrelevant=(), knowledge_tokens=500,
+            prompt_tokens=5000, capture_only=None, excluded=0,
+            retrieval_recall=1.0, retrieval_precision=0.5, mrr=1.0,
+            supplied_recall=0.5, supplied_precision=1.0,
+            reference_only=False, cases=None) -> CandidateAccount:
+    """A candidate account built from numbers chosen by hand.
+
+    Nothing here runs a model: the point of the accounting layer is that it can
+    be checked against worked examples, so the examples are worked.
+    """
+    if capture_only is None:
+        capture_only = max(0, prompt_tokens - knowledge_tokens)
+    one = CaseAccount(
+        case_id="case-1",
+        retrieved_documents=tuple(retrieved),
+        supplied_documents=tuple(supplied),
+        relevant=frozenset(relevant),
+        irrelevant=frozenset(irrelevant),
+        knowledge_chars=knowledge_tokens * 4,
+        knowledge_tokens=knowledge_tokens,
+        prompt_chars=prompt_tokens * 4,
+        prompt_tokens=prompt_tokens,
+        capture_only_tokens=capture_only,
+        excluded_by_budget=excluded,
+    )
+    return CandidateAccount(
+        candidate=Candidate(name=name, description="fixture", retrieval={},
+                            budget={}, reference_only=reference_only),
+        cases=tuple(cases) if cases is not None else (one,),
+        retrieval_metrics={"recall": retrieval_recall,
+                           "precision": retrieval_precision, "mrr": mrr},
+        supplied_metrics={"recall": supplied_recall,
+                          "precision": supplied_precision},
+    )
+
+
+def test_candidate_definitions() -> None:
+    print("\nStep 10 - candidate definitions")
+
+    names = [candidate.name for candidate in CANDIDATES]
+    check("every candidate the task named is defined",
+          set(names) >= {"baseline", "A", "B", "C", "D"}, str(names))
+    check("candidate names are unique", len(set(names)) == len(names))
+    check("the unbounded reference exists and is marked reference-only",
+          by_name("unbounded").reference_only)
+    check("no other candidate is reference-only",
+          [c.name for c in CANDIDATES if c.reference_only] == ["unbounded"])
+    check("D-partial is defined and is not marked reference-only",
+          not by_name("D-partial").reference_only)
+    check("D-partial keeps the shipped retrieval shape",
+          dict(by_name("D-partial").retrieval)["max_per_document"] == 2
+          and dict(by_name("D-partial").retrieval)["min_similarity"] is None,
+          str(dict(by_name("D-partial").retrieval)))
+    check("D-partial takes only D's char and token ceilings, not its item count",
+          dict(by_name("D-partial").budget)
+          == {"max_items": 4, "max_chars": 4000, "max_total_tokens": 1200},
+          str(dict(by_name("D-partial").budget)))
+    # The attribution probes: each must differ from D in exactly one parameter,
+    # or it attributes nothing.
+    d_config = dict(by_name("D").retrieval) | dict(by_name("D").budget)
+    for name, parameter in (("D-items4", "max_items"),
+                            ("D-mpd2", "max_per_document"),
+                            ("D-nofloor", "min_similarity")):
+        probe = by_name(name)
+        merged = dict(probe.retrieval) | dict(probe.budget)
+        differs = {key for key, value in merged.items() if d_config[key] != value}
+        check(f"{name} differs from D in exactly {parameter}",
+              differs == {parameter}, str(sorted(differs)))
+    check("the probes together cover every parameter D-partial and D disagree on "
+          "except the ones already shared",
+          {"max_items", "max_per_document", "min_similarity"}
+          <= (set(d_config) & set(dict(by_name("D-partial").retrieval)
+                                  | dict(by_name("D-partial").budget))))
+    check("the sweep-driven extra candidate isolates the per-document cap",
+          dict(by_name("A2").retrieval) | {"max_per_document": 1}
+          == dict(by_name("A").retrieval)
+          and dict(by_name("A2").budget) == dict(by_name("A").budget),
+          str(dict(by_name("A2").retrieval)))
+
+    baseline = by_name("baseline")
+    check("the baseline restates the shipped retrieval shape explicitly",
+          baseline.retrieval == {"per_query_top_k": 4, "final_top_k": 8,
+                                 "max_per_document": 2, "min_similarity": None},
+          str(dict(baseline.retrieval)))
+    check("the baseline restates the shipped budget explicitly",
+          baseline.budget == {"max_items": 4, "max_chars": 3000,
+                              "max_total_tokens": 900},
+          str(dict(baseline.budget)))
+
+    shape = {"per_query_top_k": 6, "final_top_k": 8, "max_per_document": 1,
+             "min_similarity": 0.75}
+    check("A through D share one retrieval shape, so the budget is isolated",
+          all(dict(by_name(n).retrieval) == shape for n in ("A", "B", "C", "D")))
+    check("A keeps the shipped budget",
+          dict(by_name("A").budget) == dict(baseline.budget))
+    check("B, C and D differ from each other only in the budget",
+          len({tuple(sorted(by_name(n).budget.items())) for n in ("B", "C", "D")}) == 3)
+
+    from ai.rag.context import KnowledgeContextConfig
+    from ai.rag.retrieval import RetrievalConfig
+    built = True
+    for candidate in CANDIDATES:
+        try:
+            RetrievalConfig(**dict(candidate.retrieval))
+            KnowledgeContextConfig(**dict(candidate.budget))
+        except Exception as exc:  # noqa: BLE001
+            built = False
+            check(f"{candidate.name} is a constructible configuration", False, str(exc))
+    check("every candidate is a constructible configuration", built)
+
+    check("the summary names the parameters rather than hiding them",
+          "min_similarity=0.75" in by_name("A").summary())
+
+
+def test_case_accounting() -> None:
+    print("\nStep 10 - per-case accounting")
+
+    case = CaseAccount(
+        case_id="c", retrieved_documents=("a", "b", "c"),
+        supplied_documents=("a", "c"),
+        relevant=frozenset({"a", "b", "d"}), irrelevant=frozenset({"c"}),
+        knowledge_chars=2000, knowledge_tokens=600,
+        prompt_chars=20000, prompt_tokens=5600, capture_only_tokens=5000,
+        excluded_by_budget=2,
+    )
+    check("a relevant document that was never ranked is a retrieval failure",
+          case.never_retrieved == ("d",), str(case.never_retrieved))
+    check("a relevant document retrieved then budgeted away is counted separately",
+          case.lost_before_prompt == ("b",), str(case.lost_before_prompt))
+    check("the two losses never double-count the same document",
+          not (set(case.never_retrieved) & set(case.lost_before_prompt)))
+    check("an irrelevant document that reached the prompt is named",
+          case.irrelevant_supplied == ("c",))
+    check("the knowledge share is measured against the whole request",
+          abs(case.knowledge_share - 600 / 5600) < 1e-9,
+          str(case.knowledge_share))
+    check("every problem is reported, in a fixed order",
+          len(case.problems()) == 3 and "never retrieved" in case.problems()[0])
+
+    clean = CaseAccount(
+        case_id="c", retrieved_documents=("a",), supplied_documents=("a",),
+        relevant=frozenset({"a"}), irrelevant=frozenset(),
+        knowledge_chars=100, knowledge_tokens=30, prompt_chars=400,
+        prompt_tokens=100, capture_only_tokens=70, excluded_by_budget=0)
+    check("a clean case reports no problems", clean.problems() == [])
+    check("a small request is not flagged at risk", not clean.at_risk)
+
+    risky = CaseAccount(
+        case_id="c", retrieved_documents=("a",), supplied_documents=("a",),
+        relevant=frozenset({"a"}), irrelevant=frozenset(),
+        knowledge_chars=100, knowledge_tokens=30, prompt_chars=400,
+        prompt_tokens=OBSERVED_FAILING_PROMPT_TOKENS, capture_only_tokens=70,
+        excluded_by_budget=0)
+    check("a request at a size already seen to fail is flagged", risky.at_risk)
+    check("and the flag is reported as a problem",
+          any("observed to fail" in problem for problem in risky.problems()))
+
+    def build_impossible():
+        return CaseAccount(
+            case_id="c", retrieved_documents=(), supplied_documents=(),
+            relevant=frozenset(), irrelevant=frozenset(), knowledge_chars=0,
+            knowledge_tokens=0, prompt_chars=0, prompt_tokens=100,
+            capture_only_tokens=500, excluded_by_budget=0)
+    try:
+        build_impossible()
+        check("a prompt smaller than its own capture-only size is rejected", False)
+    except ValueError:
+        check("a prompt smaller than its own capture-only size is rejected", True)
+
+
+def test_candidate_totals() -> None:
+    print("\nStep 10 - candidate totals")
+
+    cases = (
+        CaseAccount(case_id="one", retrieved_documents=("a", "b"),
+                    supplied_documents=("a",), relevant=frozenset({"a", "b"}),
+                    irrelevant=frozenset(), knowledge_chars=1000,
+                    knowledge_tokens=300, prompt_chars=16000, prompt_tokens=4300,
+                    capture_only_tokens=4000, excluded_by_budget=1),
+        CaseAccount(case_id="two", retrieved_documents=("a", "z"),
+                    supplied_documents=("a", "z"), relevant=frozenset({"a"}),
+                    irrelevant=frozenset({"z"}), knowledge_chars=2000,
+                    knowledge_tokens=700, prompt_chars=24000, prompt_tokens=6700,
+                    capture_only_tokens=6000, excluded_by_budget=0),
+    )
+    total = account(cases=cases, supplied_recall=0.75)
+    check("relevant documents lost to the budget are summed",
+          total.lost_before_prompt == 1, str(total.lost_before_prompt))
+    check("irrelevant documents supplied are summed",
+          total.irrelevant_supplied == 1)
+    check("the largest prompt is the maximum, not the mean",
+          total.max_prompt_tokens == 6700)
+    check("mean knowledge tokens are the mean",
+          abs(total.mean_knowledge_tokens - 500) < 1e-9)
+    check("evidence per 1k prices recall against the largest request",
+          abs(total.evidence_per_1k_tokens - 0.75 / 6.7) < 1e-6,
+          str(total.evidence_per_1k_tokens))
+    check("failures name their case",
+          any(problem.startswith("two:") for problem in total.failures()),
+          str(total.failures()))
+    check("an empty account does not divide by zero",
+          account(cases=()).evidence_per_1k_tokens is None)
+    check("the serialised form carries every reported column",
+          {"retrieval_recall", "supplied_recall", "lost_before_prompt",
+           "irrelevant_supplied", "max_prompt_tokens", "mean_knowledge_tokens",
+           "mean_prompt_chars", "evidence_per_1k_tokens", "mrr"}
+          <= set(total.as_dict()))
+
+
+def test_selection_rule() -> None:
+    print("\nStep 10 - the selection rule")
+
+    baseline = account("baseline", supplied_recall=0.65, prompt_tokens=6000)
+
+    better = account("better", supplied_recall=0.80, prompt_tokens=6000)
+    verdict = assess(better, baseline)
+    check("more supplied recall at the same size is admissible", verdict.admissible)
+    check("and the verdict shows the comparison it made",
+          any("supplied recall" in reason for reason in verdict.reasons))
+
+    thinner = account("thinner", supplied_recall=0.60, prompt_tokens=5000)
+    check("less supplied recall than the baseline is rejected, however cheap",
+          not assess(thinner, baseline).admissible)
+
+    noisier = account("noisier", supplied_recall=0.90, prompt_tokens=6000,
+                      supplied=("a", "z"), retrieved=("a", "b", "z"),
+                      irrelevant=("z",))
+    check("recall bought by supplying an irrelevant document is rejected",
+          not assess(noisier, baseline).admissible)
+
+    bigger = account("bigger", supplied_recall=0.95,
+                     prompt_tokens=OBSERVED_FAILING_PROMPT_TOKENS + 200,
+                     capture_only=6000)
+    check("growing a request past a size already seen to fail is rejected",
+          not assess(bigger, baseline).admissible)
+
+    already = account("already", supplied_recall=0.65,
+                      prompt_tokens=OBSERVED_FAILING_PROMPT_TOKENS + 500,
+                      capture_only=6000)
+    same_size = account("same", supplied_recall=0.80,
+                        prompt_tokens=OBSERVED_FAILING_PROMPT_TOKENS + 500,
+                        capture_only=6000)
+    check("a baseline that is already at risk does not veto an equal-sized change",
+          assess(same_size, already).admissible)
+
+    check("a reference-only candidate is never admissible",
+          not assess(account("unbounded", supplied_recall=0.99, prompt_tokens=5000,
+                             reference_only=True), baseline).admissible)
+
+    undefined = account("undefined", supplied_recall=None)
+    check("an undefined supplied recall is rejected rather than assumed",
+          not assess(undefined, baseline).admissible)
+
+    # -- ranking -----------------------------------------------------------
+    ranked = rank([baseline, better, thinner, noisier])
+    check("the best admissible candidate is recommended",
+          ranked["recommended"] == "better", str(ranked["recommended"]))
+    check("the baseline is not among the verdicts",
+          "baseline" not in [v["name"] for v in ranked["verdicts"]])
+    check("every candidate gets a verdict",
+          len(ranked["verdicts"]) == 3)
+
+    check("nothing is recommended when nothing is admissible",
+          rank([baseline, thinner, noisier])["recommended"] is None)
+
+    tie = account("tie", supplied_recall=0.65, prompt_tokens=6000)
+    check("a candidate that merely ties the baseline is not an improvement",
+          rank([baseline, tie])["recommended"] is None)
+
+    cheaper = account("cheaper", supplied_recall=0.65, prompt_tokens=4000)
+    check("the same recall in a smaller request is an improvement",
+          rank([baseline, cheaper])["recommended"] == "cheaper")
+
+    twin_a = account("aaa", supplied_recall=0.80, prompt_tokens=6000)
+    twin_b = account("bbb", supplied_recall=0.80, prompt_tokens=6000)
+    check("ties between candidates break deterministically by name",
+          rank([baseline, twin_a, twin_b])["recommended"]
+          == rank([baseline, twin_b, twin_a])["recommended"] == "bbb")
+
+    try:
+        rank([better])
+        check("ranking without a baseline is refused", False)
+    except KeyError:
+        check("ranking without a baseline is refused", True)
+
+    check("the result says plainly that it changes no default",
+          "does not change a default" in rank([baseline, better])["note"])
+
+
+def test_request_size() -> None:
+    print("\nStep 10 - request composition")
+
+    sizes = harness.evaluate_request_size()
+    scored = [row for row in sizes["cases"] if "skipped" not in row]
+    check("every available case is priced", len(scored) >= 7, str(len(scored)))
+    check("a JSON_SCHEMA provider is charged for the response schema",
+          sizes["response_format_tokens"]["groq"] > 500,
+          str(sizes["response_format_tokens"]))
+    check("a JSON_OBJECT provider is not charged twice for it",
+          sizes["response_format_tokens"]["ollama"] == 0)
+
+    check("the capture is the larger part of every request at the shipped ceiling",
+          all(row["capture_only_tokens"] > 900 for row in scored))
+    low, high = sizes["knowledge_share_range"]["900"]
+    check("and the knowledge share is reported as a range, not one number",
+          0.0 < low <= high < 0.5, f"{low}-{high}")
+
+    check("raising the ceiling raises every total by exactly the difference",
+          all(row["with_budget"]["1200"] - row["with_budget"]["900"] == 300
+              for row in scored))
+    check("the schema is added on top of the budgeted total",
+          all(row["with_budget_and_schema"]["900"] - row["with_budget"]["900"]
+              == sizes["response_format_tokens"]["groq"] for row in scored))
+
+    check("this section needs no embedding model",
+          sizes["largest_capture_only"] > 0)
+
+
+def test_request_guard_counts_schema() -> None:
+    print("\nStep 10 - the opt-in guard counts what the provider counts")
+
+    from ai.config import AIConfig
+    from ai.llm_client import _oversize_detail, response_format_tokens
+    from ai.providers import Provider
+
+    groq = AIConfig(provider=Provider.GROQ, max_input_tokens=1000)
+    schema_tokens = response_format_tokens(groq, AnalysisResult)
+    check("the schema is a large constant, not a rounding error",
+          schema_tokens > 500, str(schema_tokens))
+
+    small = [{"role": "user", "content": "x" * 100}]
+    check("a prompt under the ceiling is still refused once the schema is counted",
+          _oversize_detail(small, groq, AnalysisResult) is not None)
+    check("and is not refused when no schema travels with it",
+          _oversize_detail(small, groq, None) is None)
+    detail = _oversize_detail(small, groq, AnalysisResult) or ""
+    check("the refusal separates the prompt from the schema",
+          "in the response schema" in detail, detail)
+
+    ollama = AIConfig(provider=Provider.OLLAMA, max_input_tokens=1000)
+    check("a provider that carries the schema in the prompt is not charged twice",
+          _oversize_detail(small, ollama, AnalysisResult) is None)
+
+    check("the default configuration still has no ceiling, so none of this fires",
+          AIConfig(provider=Provider.GROQ).max_input_tokens is None)
+
+
+# ===========================================================================
+# Step 10 -- the CLI contract
+# ===========================================================================
+def test_cli_contract() -> None:
+    print("\nStep 10 - the CLI contract")
+
+    import io as _io
+    import tempfile
+    from contextlib import redirect_stderr, redirect_stdout
+
+    # -- run() always returns a dictionary --------------------------------
+    source = Path("run_rag_evaluation.py").read_text(encoding="utf-8")
+    body = source[source.index("def run(live"):source.index("def render(")]
+    returns = re.findall(r"^\s+return (\w+)", body, re.MULTILINE)
+    check("every return in run() returns the result dictionary",
+          returns and set(returns) == {"result"}, str(returns))
+    check("run() has a return on the IndexUnavailable path and at the end",
+          len(returns) == 2, str(len(returns)))
+    check("run() never returns None implicitly",
+          not re.search(r"^\s+return\s*$", body, re.MULTILINE))
+
+    # -- JSON mode puts a document on stdout and nothing else -------------
+    out, err = _io.StringIO(), _io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = harness.main(["--json"])
+    printed = out.getvalue()
+    check("--json exits zero", code == 0, str(code))
+    check("--json prints one parseable JSON document", bool(json.loads(printed)))
+    check("--json prints nothing before the document",
+          printed.lstrip().startswith("{") and printed.startswith("{"),
+          repr(printed[:40]))
+    check("--json prints no section headings",
+          "1. DATASET" not in printed and "=" * 20 not in printed)
+
+    # -- plain mode is unchanged -------------------------------------------
+    out2, err2 = _io.StringIO(), _io.StringIO()
+    with redirect_stdout(out2), redirect_stderr(err2):
+        code2 = harness.main([])
+    report = out2.getvalue()
+    check("plain mode exits zero", code2 == 0)
+    check("plain mode still prints the human report",
+          "1. DATASET" in report and "10. LIMITATIONS" in report)
+    check("plain mode prints no JSON document", not report.lstrip().startswith("{"))
+
+    # -- --out writes UTF-8 and verifies it --------------------------------
+    with tempfile.TemporaryDirectory() as folder:
+        target = str(Path(folder) / "result.json")
+        err3 = _io.StringIO()
+        with redirect_stdout(_io.StringIO()), redirect_stderr(err3):
+            code3 = harness.main(["--json", "--out", target])
+        check("--out exits zero", code3 == 0)
+        raw = Path(target).read_bytes()
+        check("--out writes UTF-8 with no byte-order mark",
+              not raw.startswith(b"\xef\xbb\xbf") and not raw.startswith(b"\xff\xfe"),
+              repr(raw[:4]))
+        check("--out writes LF line endings, not CRLF", b"\r\n" not in raw)
+        with open(target, encoding="utf-8") as handle:
+            check("--out produces a file that json.load accepts",
+                  bool(json.load(handle)))
+        check("--out prints nothing to stdout", True)
+        check("--out reports the file on stderr, where it cannot corrupt the data",
+              "verified to parse as JSON" in err3.getvalue(), err3.getvalue()[:120])
+
+        # -- a crash still produces a parseable document -------------------
+        original = harness.run
+        harness.run = lambda live=False: (_ for _ in ()).throw(
+            RuntimeError("simulated failure"))
+        try:
+            crash_out, crash_err = _io.StringIO(), _io.StringIO()
+            with redirect_stdout(crash_out), redirect_stderr(crash_err):
+                crash_code = harness.main(["--json"])
+        finally:
+            harness.run = original
+        check("a crash in JSON mode exits non-zero", crash_code == 1, str(crash_code))
+        document = json.loads(crash_out.getvalue())
+        check("and still prints a parseable JSON document", isinstance(document, dict))
+        check("which names the failure",
+              document["error"]["type"] == "RuntimeError"
+              and "simulated failure" in document["error"]["detail"])
+        check("and keeps every top-level key, so a reader can diff it",
+              {"retrieval", "budget", "thresholds", "candidates", "index"}
+              <= set(document))
+        check("the traceback reaches stderr for a person to read",
+              "Traceback" in crash_err.getvalue())
+        check("and the document carries it too, for a machine to read",
+              "Traceback" in document["error"]["traceback"])
+        check("the document is still a document, not a traceback",
+              crash_out.getvalue().lstrip().startswith("{"))
+
+
+def test_request_size_accounting() -> None:
+    print("\nStep 10 - what the provider actually meters")
+
+    case = CaseAccount(
+        case_id="c", retrieved_documents=("a",), supplied_documents=("a",),
+        relevant=frozenset({"a"}), irrelevant=frozenset(),
+        knowledge_chars=1000, knowledge_tokens=300,
+        prompt_chars=20000, prompt_tokens=6500, capture_only_tokens=6200,
+        excluded_by_budget=0, alongside_tokens=1130)
+    check("the request is the prompt plus what travels with it",
+          case.request_tokens == 7630)
+    check("a prompt under the failing size can still be an over-size request",
+          case.prompt_tokens < OBSERVED_FAILING_PROMPT_TOKENS and case.at_risk)
+    check("and the problem names both halves",
+          any("prompt +" in problem for problem in case.problems()),
+          str(case.problems()))
+    check("a case with nothing alongside is unchanged",
+          CaseAccount(case_id="c", retrieved_documents=(), supplied_documents=(),
+                      relevant=frozenset(), irrelevant=frozenset(),
+                      knowledge_chars=0, knowledge_tokens=0, prompt_chars=0,
+                      prompt_tokens=100, capture_only_tokens=100,
+                      excluded_by_budget=0).request_tokens == 100)
+
+    safe = account("safe", supplied_recall=0.65, prompt_tokens=5000)
+    crossing = account("crossing", supplied_recall=0.95,
+                       prompt_tokens=OBSERVED_FAILING_PROMPT_TOKENS + 100,
+                       capture_only=6000)
+    verdict = assess(crossing, safe)
+    check("a change that crosses into the failing size is rejected",
+          not verdict.admissible)
+    check("and the reason says it is the change that crosses it",
+          any("crosses the" in reason for reason in verdict.reasons))
+
+    # Both already over: size cannot discriminate, and the rule must not
+    # pretend otherwise in either direction.
+    over_base = account("over", supplied_recall=0.65,
+                        prompt_tokens=OBSERVED_FAILING_PROMPT_TOKENS + 300,
+                        capture_only=6000)
+    over_cand = account("bigger", supplied_recall=0.90,
+                        prompt_tokens=OBSERVED_FAILING_PROMPT_TOKENS + 600,
+                        capture_only=6000)
+    both = assess(over_cand, over_base)
+    check("when the baseline is already over, size does not reject a candidate",
+          both.admissible)
+    check("but the report is told size cannot separate them",
+          any("does not separate" in reason for reason in both.reasons),
+          str(both.reasons))
+    check("and ranking marks the size axis uninformative",
+          rank([over_base, over_cand], baseline_name="over")["size_axis_informative"]
+          is False)
+    check("while a safe baseline leaves it informative",
+          rank([safe, account("ok", supplied_recall=0.7, prompt_tokens=5000)],
+               baseline_name="safe")["size_axis_informative"] is True)
+
+    # -- the tie-break --------------------------------------------------
+    lo = account("lo", supplied_recall=0.9, supplied_precision=0.5,
+                 prompt_tokens=6000)
+    hi = account("hi", supplied_recall=0.9, supplied_precision=0.9,
+                 prompt_tokens=6000)
+    base = account("baseline", supplied_recall=0.6, supplied_precision=0.9,
+                   prompt_tokens=6000)
+    check("an evidence-per-token tie is broken by supplied precision, not by name",
+          rank([base, lo, hi])["recommended"] == "hi")
+    small = account("small", supplied_recall=0.6, supplied_precision=0.9,
+                    prompt_tokens=5000)
+    large = account("large", supplied_recall=0.72, supplied_precision=0.9,
+                    prompt_tokens=6000)
+    check("and a genuinely better score still wins over a smaller request",
+          rank([base, small, large])["recommended"] in {"small", "large"})
 
 
 # ===========================================================================
 def main() -> int:
     print(f"Python {sys.version.split()[0]} on {sys.platform}")
-    print("RAG step 8 -- evaluation harness tests")
+    print("RAG steps 8 and 10 -- evaluation harness and candidate accounting")
 
     test_metrics()
     test_dataset()
@@ -664,6 +1216,14 @@ def main() -> int:
     test_sweeps()
     test_grounding()
     test_output()
+    test_candidate_definitions()
+    test_case_accounting()
+    test_candidate_totals()
+    test_selection_rule()
+    test_request_size()
+    test_request_guard_counts_schema()
+    test_cli_contract()
+    test_request_size_accounting()
 
     total = _passed + _failed
     print(f"\n{_passed}/{total} checks passed")

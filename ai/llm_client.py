@@ -16,12 +16,13 @@ reach a prompt.
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol, TypeVar
+from typing import Any, Final, Protocol, Sequence, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -185,6 +186,7 @@ class FailureReason(str, Enum):
     RATE_LIMITED = "rate_limited"
     TIMEOUT = "timeout"
     API_ERROR = "api_error"
+    REQUEST_TOO_LARGE = "request_too_large"
     INVALID_RESPONSE = "invalid_response"
     REFUSED = "refused"
 
@@ -207,6 +209,90 @@ class LLMResult:
     @property
     def ok(self) -> bool:
         return self.parsed is not None
+
+
+#: Characters per token, for the pre-flight size estimate.
+#:
+#: The same deliberately pessimistic ratio :mod:`ai.rag.context` budgets with,
+#: repeated here rather than imported: this module must not depend on the RAG
+#: layer, which is optional and can be deleted without touching the provider
+#: path.  Pessimistic is the right direction for a guard -- it declines a
+#: request that might have squeezed through, rather than sending one that
+#: cannot.
+_CHARS_PER_TOKEN: Final[float] = 3.5
+
+
+def estimate_request_tokens(messages: Sequence[dict[str, str]]) -> int:
+    """Rough input size of a message list, in tokens.
+
+    Deliberately not a tokenizer.  Installing one to count the characters we
+    already have would add a large dependency to answer a question whose only
+    consumer is a threshold, and a tokenizer for one provider's model is not a
+    tokenizer for another's.  The per-message constant covers the role and the
+    framing every chat API adds around content.
+    """
+    total = 0
+    for message in messages:
+        total += math.ceil(len(message.get("content", "")) / _CHARS_PER_TOKEN) + 4
+    return total
+
+
+def response_format_tokens(cfg: Any, schema: type[BaseModel] | None) -> int:
+    """Estimated size of anything sent *alongside* the prompt, per provider.
+
+    A ``JSON_SCHEMA`` provider (Groq) receives the whole JSON Schema in
+    ``response_format``. The provider meters it exactly as it meters the
+    prompt, and for this project's schema it is on the order of a thousand
+    tokens -- comfortably more than the knowledge block is usually allowed.
+
+    Counting only the messages therefore understates a Groq request by a
+    constant that is larger than most of the things a budget argues about, so
+    the guard counts it. ``NATIVE_PARSE`` sends the schema too; ``JSON_OBJECT``
+    already carries it inside the prompt and must not be charged twice.
+    """
+    if schema is None:
+        return 0
+    mode = getattr(getattr(cfg, "spec", None), "structured_mode", None)
+    if mode not in (StructuredMode.JSON_SCHEMA, StructuredMode.NATIVE_PARSE):
+        return 0
+    try:
+        body = json.dumps(to_strict_json_schema(schema.model_json_schema()),
+                          sort_keys=True)
+    except Exception:  # noqa: BLE001 - a size estimate must never break a call
+        return 0
+    return math.ceil(len(body) / _CHARS_PER_TOKEN)
+
+
+def _oversize_detail(messages: Sequence[dict[str, str]], cfg: Any,
+                     schema: type[BaseModel] | None = None) -> str | None:
+    """Why this request should not be sent, or ``None`` to send it.
+
+    A request past the provider's known per-request ceiling is refused *here*,
+    before the round trip.  Not to be clever about rate limits: an HTTP 413
+    from Groq arrives as a bare ``APIStatusError``, which is indistinguishable
+    from a dozen unrelated server-side problems and carries no advice about
+    what to make smaller.  Refusing locally can say exactly which knob to turn.
+
+    This never shrinks, truncates or reshapes the request, and never switches
+    provider.  It declines, and says why.
+    """
+    ceiling = getattr(cfg, "max_input_tokens", None)
+    if not ceiling:
+        return None
+    prompt = estimate_request_tokens(messages)
+    alongside = response_format_tokens(cfg, schema)
+    estimated = prompt + alongside
+    if estimated <= ceiling:
+        return None
+    hint = getattr(cfg.spec, "oversize_hint", "")
+    breakdown = (f" ({prompt} in the prompt, {alongside} in the response schema)"
+                 if alongside else "")
+    detail = (
+        f"The request is about {estimated} input tokens{breakdown}, above the "
+        f"{ceiling}-token ceiling configured for {cfg.spec.label}. It was not "
+        "sent, because a request this size is rejected rather than answered."
+    )
+    return f"{detail} {hint}".strip()
 
 
 class LLMClient(Protocol):
@@ -306,8 +392,15 @@ class ProviderClient:
         if isinstance(exc, openai.BadRequestError):
             return FailureReason.API_ERROR, False
         if isinstance(exc, openai.APIStatusError):
-            retryable = getattr(exc, "status_code", 0) >= 500
-            return FailureReason.API_ERROR, retryable
+            status = getattr(exc, "status_code", 0)
+            # 413 is the one status the OpenAI SDK has no exception class for
+            # and that has a specific, actionable cause: the request was larger
+            # than the provider will accept in one call. Left as API_ERROR it
+            # reads as "usually transient" and invites a retry that cannot
+            # work, because nothing about the request will be smaller next time.
+            if status == 413:
+                return FailureReason.REQUEST_TOO_LARGE, False
+            return FailureReason.API_ERROR, status >= 500
         return FailureReason.API_ERROR, False
 
     # ------------------------------------------------------------------
@@ -392,6 +485,10 @@ class ProviderClient:
             import openai  # noqa: F401
         except ImportError as exc:
             return fail(FailureReason.SDK_MISSING, f"openai package not installed: {exc}")
+
+        oversize = _oversize_detail(messages, cfg, schema)
+        if oversize is not None:
+            return fail(FailureReason.REQUEST_TOO_LARGE, oversize)
 
         last_reason = FailureReason.API_ERROR
         last_detail = ""

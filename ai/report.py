@@ -114,7 +114,8 @@ def render_knowledge(outcome: AnalysisOutcome) -> list[str]:
         )
         signals = ", ".join(s.value for s in item.matched_signal_types) or "capture profile"
         lines.append(
-            f"       similarity: {item.similarity:.2f}   {mark}"
+            f"       similarity: {item.similarity:.2f}   "
+            f"scope: {item.compatibility}   {mark}"
         )
         lines.append(f"       matched signals: {signals}")
 

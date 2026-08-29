@@ -747,7 +747,8 @@ def test_provenance() -> None:
           result.model_name == MODEL_NAME and result.dimension == 6)
     check("the report records the parameters used",
           set(result.parameters) == {"per_query_top_k", "final_top_k", "min_similarity",
-                                     "max_per_document", "include_capture_query"},
+                                     "max_per_document", "include_capture_query",
+                                     "affinity", "query_style"},
           str(sorted(result.parameters)))
     check("the report exposes distinct document ids",
           set(result.document_ids()) <= {c.document_id for c in chunks})

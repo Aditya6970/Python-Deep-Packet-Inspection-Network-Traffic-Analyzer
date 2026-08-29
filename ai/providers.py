@@ -41,7 +41,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Final
+from typing import Any, Final, Sequence
 
 __all__ = [
     "Provider",
@@ -51,6 +51,8 @@ __all__ = [
     "get_provider_spec",
     "parse_provider",
     "to_strict_json_schema",
+    "PROVIDER_OMITTED_FIELDS",
+    "unenforced_constants",
 ]
 
 
@@ -91,6 +93,17 @@ class ProviderSpec:
     #: Whether the provider guarantees schema conformance in its top tier.
     strict_schema: bool
     setup_hint: str
+    #: Largest request, in estimated input tokens, worth sending to this
+    #: provider.  ``None`` means "no locally-known limit"; the provider decides.
+    #:
+    #: This is not the model's context window.  It is the point past which a
+    #: request is *rejected by policy* rather than answered -- a per-minute
+    #: token allowance, most often -- which is a different and much lower
+    #: number.  Where that number is known it is worth checking before spending
+    #: a round trip on a request that cannot succeed.
+    max_input_tokens: int | None = None
+    #: What to tell someone whose request exceeded :attr:`max_input_tokens`.
+    oversize_hint: str = ""
 
 
 PROVIDERS: Final[dict[Provider, ProviderSpec]] = {
@@ -114,6 +127,25 @@ PROVIDERS: Final[dict[Provider, ProviderSpec]] = {
             "GROQ_API_KEY in your environment or .env file. Groq retires "
             "models periodically — if you see a model_not_found error, check "
             "https://console.groq.com/docs/models and set GROQ_MODEL."
+        ),
+        # Deliberately None, despite Groq being the provider where oversized
+        # requests actually bite. Groq meters tokens per minute and rejects a
+        # single request larger than the whole allowance with HTTP 413
+        # "Request too large" — not throttled, rejected. But that allowance is
+        # a property of the *account tier*, which this code cannot observe: a
+        # free key and a paid key differ by more than an order of magnitude.
+        #
+        # A guessed ceiling would refuse requests that would have succeeded,
+        # which is a worse failure than the one it prevents — so the guess is
+        # not made. What happens instead: an actual 413 is classified as
+        # REQUEST_TOO_LARGE rather than a bare API_ERROR, and the hint below is
+        # shown either way. Someone who knows their own limit sets
+        # DPI_MAX_INPUT_TOKENS and gets the refusal before the round trip.
+        max_input_tokens=None,
+        oversize_hint=(
+            "Reduce the request with --rag-max-items/--rag-max-chars, or "
+            "--max-flows to send fewer flows; raise the ceiling with "
+            "DPI_MAX_INPUT_TOKENS if your account's rate limit allows it."
         ),
     ),
     Provider.OLLAMA: ProviderSpec(
@@ -177,7 +209,54 @@ def get_provider_spec(provider: Provider) -> ProviderSpec:
 # ---------------------------------------------------------------------------
 # JSON Schema conversion
 # ---------------------------------------------------------------------------
-def to_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+#: Root properties withheld from a provider-enforced schema.
+#:
+#: ``schema_version`` is ours, not the model's.  Pydantic renders it as
+#: ``{"const": "1.1"}``, and ``const`` is the one keyword in this schema that a
+#: constrained decoder may not enforce while the provider's own validator still
+#: checks it.  When those two disagree the model emits some other string, the
+#: completion fails validation server-side, and the call comes back HTTP 400
+#: ``code=json_validate_failed`` -- which is exactly what one live case did.
+#:
+#: It is also the only field the model has no way to get right: nothing in the
+#: prompt tells it our schema version, so it is guessing a literal.  Asking a
+#: language model to reproduce a constant we already know is a request that can
+#: only fail, so it is not asked.  :class:`~ai.schemas.AnalysisResult` keeps
+#: the field, keeps the ``Literal`` and keeps validating it; the default fills
+#: it in when the response arrives.
+PROVIDER_OMITTED_FIELDS: Final[tuple[str, ...]] = ("schema_version",)
+
+
+def unenforced_constants(schema: dict[str, Any]) -> list[str]:
+    """Paths in a strict schema that use ``const``, which decoders may ignore.
+
+    A standing check rather than a one-off fix.  ``const`` is safe when the
+    provider constrains generation to it and unsafe when the provider only
+    validates afterwards, and which of those happens is not something this
+    project can see.  So the rule is simply that a provider-enforced schema
+    carries none: a future ``Literal`` field either gets omitted like
+    ``schema_version`` or gets a deliberate decision, and the test that calls
+    this refuses to let it pass unnoticed.
+    """
+    found: list[str] = []
+
+    def walk(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            if "const" in node:
+                found.append(path or "<root>")
+            for key, value in node.items():
+                walk(value, f"{path}.{key}" if path else key)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+
+    walk(schema, "")
+    return sorted(found)
+
+
+def to_strict_json_schema(schema: dict[str, Any],
+                          omit: Sequence[str] = PROVIDER_OMITTED_FIELDS
+                          ) -> dict[str, Any]:
     """Adapt a Pydantic JSON Schema for strict structured-output mode.
 
     Providers that guarantee conformance (OpenAI, Groq on gpt-oss) impose
@@ -195,6 +274,15 @@ def to_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
     Operates on a deep copy; the input is not modified.
     """
     result = copy.deepcopy(schema)
+
+    # Withheld before strictification, so the omitted names never reach
+    # ``required`` either.  Dropping a property but leaving it required would
+    # produce a schema nothing can satisfy.
+    properties = result.get("properties")
+    if isinstance(properties, dict):
+        for name in omit:
+            properties.pop(name, None)
+
     _strictify(result)
 
     # $defs are referenced by the root, so they need the same treatment.

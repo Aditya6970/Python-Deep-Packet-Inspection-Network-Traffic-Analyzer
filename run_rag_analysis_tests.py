@@ -44,6 +44,7 @@ from ai.config import AIConfig
 from ai.extractor import build_capture_report
 from ai.llm_client import FailureReason, FakeLLMClient
 from ai.prompts import (
+    CAPTURE_FORMATS,
     KNOWLEDGE_PROMPT_VERSION,
     KNOWLEDGE_RULES,
     PROMPT_VERSION,
@@ -594,18 +595,38 @@ def test_budget() -> None:
         return message.split("===== BEGIN CAPTURE DATA =====")[1].split(
             "===== END CAPTURE DATA =====")[0]
 
+    def flow_ids_in_prompt(message: str, capture_format: str) -> set[int]:
+        """Flow ids the prompt carries, whichever layout rendered them."""
+        block = capture_json(message)
+        if capture_format == "json":
+            return {int(value) for value in
+                    re.findall(r'"flow_id":\s*(\d+)', block)}
+        rows = block.split("===== BEGIN FLOWS =====\n")[1].split(
+            "\n===== END FLOWS")[0].splitlines()
+        columns = rows[0].split("|")
+        index = columns.index("flow_id")
+        return {int(row.split("|")[index]) for row in rows[1:]}
+
     plain = build_messages(report, None, None)
     check("the capture JSON is byte-identical with and without knowledge",
           capture_json(plain[1]["content"]) == capture_json(small[1]["content"]))
     check("the capture JSON is byte-identical at every budget",
           capture_json(big[1]["content"]) == capture_json(small[1]["content"]))
+    # The guarantee is that the knowledge budget never removes DPI evidence.
+    # Asserted against the flow ids the prompt actually carries, in *both*
+    # capture layouts, rather than against one layout's punctuation -- the
+    # previous form matched the JSON spelling `"flow_id": 3` and would have
+    # passed a prompt that silently dropped flows in any other rendering.
     for limit in (0, 1, 99):
         built = build_knowledge_context(retrieval,
                                         KnowledgeContextConfig(max_items=limit))
-        messages = build_messages(report, None, built.text or None)
-        check(f"max_items={limit} leaves every flow in the prompt",
-              all(f'"flow_id": {f.flow_id}' in messages[1]["content"]
-                  for f in report.flows))
+        for capture_format in CAPTURE_FORMATS:
+            messages = build_messages(report, None, built.text or None,
+                                      capture_format)
+            carried = flow_ids_in_prompt(messages[1]["content"], capture_format)
+            check(f"max_items={limit} leaves every flow in the {capture_format} prompt",
+                  carried == {f.flow_id for f in report.flows},
+                  f"{sorted(carried)} vs {sorted(f.flow_id for f in report.flows)}")
 
     # -- zero budgets and empty retrieval ----------------------------------
     zero = build_knowledge_context(retrieval, KnowledgeContextConfig(max_items=0))

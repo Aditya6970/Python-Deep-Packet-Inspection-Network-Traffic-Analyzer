@@ -8,7 +8,7 @@ exists, and deleting it changes nothing about how the analyzer behaves.  That
 separation is the point -- an evaluation harness that the thing under test
 depends on cannot be trusted to judge it.
 
-Two modules:
+Three modules:
 
 * :mod:`evaluation.metrics` -- the arithmetic.  Recall@K, Precision@K, Hit@K
   and MRR over ranked id lists.  Pure functions with no notion of retrieval,
@@ -16,6 +16,9 @@ Two modules:
 * :mod:`evaluation.cases` -- the dataset.  Capture reports paired with what a
   correct system should do with them, written by hand and never derived from
   model output.
+* :mod:`evaluation.candidates` -- the configurations under consideration and
+  the accounting that compares them, including what each one costs to send.
+  Pure arithmetic over measurements someone else took.
 
 The runner lives at the repository root as ``run_rag_evaluation.py``, beside
 the other ``run_*`` entry points.
@@ -30,6 +33,6 @@ observed result measures nothing.
 
 from __future__ import annotations
 
-__all__ = ["cases", "metrics"]
+__all__ = ["candidates", "cases", "metrics"]
 
-__version__ = "1.0"
+__version__ = "1.1"

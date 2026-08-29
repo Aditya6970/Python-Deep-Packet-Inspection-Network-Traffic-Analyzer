@@ -27,6 +27,16 @@ What needs what
   ``BAAI/bge-small-en-v1.5`` weights. Without them those sections state that
   they were skipped and why -- they are never estimated or faked.
 * The live pass additionally needs ``GROQ_API_KEY`` and ``--live``.
+
+Sections
+--------
+1 dataset, 2 signal extraction, 2b request composition, 3-4 retrieval metrics,
+4b before/after by one change at a time, 4c named candidates priced in tokens,
+5 context budget sweep, 6 threshold sweeps, 7 live grounding, 8 failures,
+9 recommended defaults, 10 limitations.
+
+Sections 1, 2, 2b, 8, 9 and 10 need no embedding model and run anywhere; the
+rest state that they were skipped, and why, rather than being estimated.
 """
 
 from __future__ import annotations
@@ -37,6 +47,7 @@ import json
 import os
 import re
 import sys
+import traceback
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, Sequence
@@ -44,6 +55,14 @@ from typing import Any, Sequence
 # Import the package so its console-encoding fix is applied before any output.
 import dpi  # noqa: F401
 from ai.schemas import CaptureReport
+from evaluation.candidates import (
+    CANDIDATES,
+    OBSERVED_FAILING_PROMPT_TOKENS,
+    Candidate,
+    CandidateAccount,
+    CaseAccount,
+    rank,
+)
 from evaluation.cases import CASES, CORPUS_DOCUMENT_IDS, EvaluationCase, cases_for_live
 from evaluation.metrics import (
     DEFAULT_K_VALUES,
@@ -150,6 +169,90 @@ def evaluate_signals() -> dict[str, Any]:
 
 
 # ===========================================================================
+# Phase 4d -- what a request is actually made of
+# ===========================================================================
+#: Knowledge budgets priced against every capture, in estimated tokens.
+#:
+#: The shipped ceiling and the one every step 10 candidate proposes, so the
+#: difference between them can be read directly rather than inferred.
+_BUDGET_CEILINGS: tuple[int, ...] = (900, 1200)
+
+
+def evaluate_request_size() -> dict[str, Any]:
+    """Price the whole request, per case, with no embedding model involved.
+
+    This section exists because the context budget bounds the knowledge block
+    and the live failures are about the *request*, and those are not the same
+    thing by a wide margin. Everything measured here is independent of which
+    chunks retrieval happens to pick: the capture JSON is whatever the DPI
+    engine produced, the instructions are fixed, and the knowledge block is
+    bounded by its ceiling whatever is in it. So this runs on any machine,
+    including one where the embedding model will not load, and it is the part
+    of the evaluation that speaks to the 413s.
+
+    An upper bound, stated as one: each row is the capture-only request plus
+    the *full* knowledge ceiling plus whatever the provider is sent alongside.
+    A run that supplies less knowledge than its budget allows produces a
+    smaller request than the figure here, never a larger one.
+    """
+    from ai.llm_client import estimate_request_tokens, response_format_tokens
+    from ai.prompts import build_messages
+    from ai.config import AIConfig
+    from ai.providers import Provider
+    from ai.schemas import AnalysisResult
+
+    alongside = {
+        provider.value: response_format_tokens(AIConfig(provider=provider),
+                                               AnalysisResult)
+        for provider in Provider
+    }
+    groq_extra = alongside[Provider.GROQ.value]
+
+    rows: list[dict[str, Any]] = []
+    for case in CASES:
+        report = case.report()
+        if report is None:
+            rows.append({"case": case.case_id, "skipped": "capture unavailable"})
+            continue
+        messages = build_messages(report, None, None)
+        capture_only = estimate_request_tokens(messages)
+        by_format = _capture_only_by_format(report)
+        rows.append({
+            "case": case.case_id,
+            "capture_by_format": by_format,
+            "flows": len(report.flows),
+            "capture_only_tokens": capture_only,
+            "capture_only_chars": sum(len(m["content"]) for m in messages),
+            "with_budget": {str(ceiling): capture_only + ceiling
+                            for ceiling in _BUDGET_CEILINGS},
+            "with_budget_and_schema": {
+                str(ceiling): capture_only + ceiling + groq_extra
+                for ceiling in _BUDGET_CEILINGS},
+        })
+
+    scored = [row for row in rows if "skipped" not in row]
+    shares = [
+        {str(ceiling): round(ceiling / (row["capture_only_tokens"] + ceiling), 4)
+         for ceiling in _BUDGET_CEILINGS}
+        for row in scored
+    ]
+    return {
+        "response_format_tokens": alongside,
+        "budget_ceilings": list(_BUDGET_CEILINGS),
+        "observed_failing_prompt_tokens": OBSERVED_FAILING_PROMPT_TOKENS,
+        "cases": rows,
+        "largest_capture_only": max((row["capture_only_tokens"] for row in scored),
+                                    default=0),
+        "knowledge_share_range": {
+            str(ceiling): [
+                min((share[str(ceiling)] for share in shares), default=0.0),
+                max((share[str(ceiling)] for share in shares), default=0.0),
+            ] for ceiling in _BUDGET_CEILINGS
+        },
+    }
+
+
+# ===========================================================================
 # Index construction (everything below needs it)
 # ===========================================================================
 class IndexUnavailable(Exception):
@@ -239,6 +342,33 @@ def evaluate_retrieval(store: Any, embedder: Any,
             "group": case.group,
             "retrieved_chunks": retrieval.chunk_count,
             "queries": retrieval.query_count,
+            # Phase B diagnostics: what was asked, what came back, and why it
+            # was ranked where it was.  Recorded for every case rather than
+            # only the interesting ones, so a future regression is visible in
+            # the same place a current one is.
+            "query_detail": [
+                {"label": query.label,
+                 "signal_id": query.signal_id,
+                 "topic": query.text.splitlines()[0]}
+                for query in retrieval.queries
+            ],
+            "chunk_detail": [
+                {"rank": chunk.rank,
+                 "document": chunk.document_id,
+                 "section": chunk.section,
+                 "similarity": round(chunk.similarity, 4),
+                 "matched_by": list(chunk.matched_query_labels),
+                 "best_query": max(chunk.per_query_similarity,
+                                   key=lambda label: (chunk.per_query_similarity[label],
+                                                      label)),
+                 "compatibility": chunk.compatibility.value,
+                 "tier": chunk.affinity_tier,
+                 "relevant": chunk.document_id in case.relevant_documents,
+                 "labelled_irrelevant": chunk.document_id in case.irrelevant_documents,
+                 "why": chunk.affinity_note}
+                for chunk in retrieval.chunks
+            ],
+            "notes": list(retrieval.notes),
             "documents_ranked": list(dict.fromkeys(documents)),
             "top_similarity": round(retrieval.chunks[0].similarity, 4)
             if retrieval.chunks else None,
@@ -261,6 +391,364 @@ def evaluate_retrieval(store: Any, embedder: Any,
                              for k in k_values],
         "section_summary": [aggregate(section_rows, k, "chunk").model_dump()
                             for k in k_values],
+    }
+
+
+# ===========================================================================
+# Phase 3b -- before / after, one change at a time
+# ===========================================================================
+#: The configurations compared, in the order they are reported.
+#:
+#: ``baseline`` is the configuration measured in step 8, reproduced exactly.
+#: Each ``+`` row turns on exactly one change, so a difference in the totals can
+#: be attributed rather than guessed at, and ``shipped`` is what the defaults
+#: now produce.  Nothing here is a tuning grid -- it is a controlled comparison
+#: of named alternatives, and every row is run against the same index.
+#:
+#: The ``?`` rows are **candidates that are not shipped**.  They exist because
+#: the step 8 sweep suggested them and the argument for them is not settled:
+#: with six documents and eight slots, one chunk per document puts the entire
+#: corpus in every result, which reads as diversity and can equally well read
+#: as "everything, including the notes that do not apply".  Measuring them here
+#: costs one more pass over an index that is already built, and turns a
+#: plausible-sounding default into a decision someone can check.
+def _variant_configs() -> list[tuple[str, Any, str]]:
+    from ai.rag.affinity import AffinityMode
+    from ai.rag.retrieval import RetrievalConfig
+
+    return [
+        ("baseline", RetrievalConfig(affinity=AffinityMode.OFF,
+                                     query_style="security"),
+         "step 8 defaults: similarity only"),
+        ("+query wording", RetrievalConfig(affinity=AffinityMode.OFF,
+                                           query_style="topical"),
+         "neutral lead-in, nothing else"),
+        ("+compatibility", RetrievalConfig(affinity=AffinityMode.RANK,
+                                           query_style="security"),
+         "applies_to tiering, nothing else"),
+        ("shipped", RetrievalConfig(),
+         "both together -- the current defaults"),
+        ("?diversity", RetrievalConfig(max_per_document=1),
+         "CANDIDATE, not shipped: shipped plus one chunk per document"),
+        ("?tight budget", RetrievalConfig(max_per_document=1, final_top_k=5),
+         "CANDIDATE, not shipped: retrieve about what the budget can carry"),
+    ]
+
+
+def _variant_row(label: str, why: str, config: Any, store: Any, embedder: Any,
+                 k_values: Sequence[int]) -> dict[str, Any]:
+    """Score one configuration over every case, retrieved *and* supplied.
+
+    Two levels, because they answer different questions and only one of them is
+    about the model's input:
+
+    * **retrieved** -- everything the ranking returned. Useful for seeing what
+      the corpus offered.
+    * **supplied** -- what survived the shipped context budget and actually
+      reached the prompt. This is the level a ranking change is *for*: with six
+      documents and eight slots, demoting a note cannot remove it from the
+      retrieved set, but it very much can keep it out of the four excerpts the
+      budget can afford.
+
+    The budget is held fixed at the shipped configuration across every variant,
+    so the comparison is "better evidence for the same tokens" rather than
+    "more tokens".
+    """
+    from ai.rag.context import KnowledgeContextConfig, build_knowledge_context
+
+    budget = KnowledgeContextConfig()
+    document_rows: list[RetrievalMetrics] = []
+    section_rows: list[RetrievalMetrics] = []
+    supplied_rows: list[RetrievalMetrics] = []
+    per_case: list[dict[str, Any]] = []
+    missed: list[str] = []
+    wrong: list[str] = []
+    supplied_missed: list[str] = []
+    supplied_wrong: list[str] = []
+    tokens: list[int] = []
+    scored = 0
+
+    for case in CASES:
+        report = case.report()
+        if report is None:
+            continue
+        scored += 1
+        retrieval = _retrieve(case, report, store, embedder, config)
+        documents = _document_ranking(retrieval.chunks)
+        for k in k_values:
+            document_rows.append(score_ranking(documents, case.relevant_documents, k,
+                                               "document", case.irrelevant_documents))
+            section_rows.append(score_ranking(_section_ranking(retrieval.chunks),
+                                              case.relevant_sections, k, "chunk",
+                                              dedupe=False))
+
+        context = build_knowledge_context(retrieval, budget)
+        supplied = [item.document_id for item in context.items]
+        tokens.append(context.estimated_tokens)
+        supplied_rows.append(score_ranking(supplied, case.relevant_documents,
+                                           budget.max_items, "document",
+                                           case.irrelevant_documents))
+
+        case_missed = sorted(case.relevant_documents - set(documents))
+        case_wrong = sorted(case.irrelevant_documents & set(documents))
+        case_supplied_missed = sorted(case.relevant_documents - set(supplied))
+        case_supplied_wrong = sorted(case.irrelevant_documents & set(supplied))
+        missed.extend(f"{case.case_id}:{doc}" for doc in case_missed)
+        wrong.extend(f"{case.case_id}:{doc}" for doc in case_wrong)
+        supplied_missed.extend(f"{case.case_id}:{doc}" for doc in case_supplied_missed)
+        supplied_wrong.extend(f"{case.case_id}:{doc}" for doc in case_supplied_wrong)
+        per_case.append({
+            "case": case.case_id,
+            "documents": list(dict.fromkeys(documents)),
+            "supplied": supplied,
+            "missed": case_missed,
+            "irrelevant": case_wrong,
+            "supplied_missed": case_supplied_missed,
+            "supplied_irrelevant": case_supplied_wrong,
+            "estimated_tokens": context.estimated_tokens,
+        })
+
+    supplied_summary = aggregate(supplied_rows, budget.max_items, "document").model_dump()
+    return {
+        "label": label,
+        "why": why,
+        "config": config.as_dict(),
+        "budget": budget.describe(),
+        "cases_scored": scored,
+        "documents": {str(k): aggregate(document_rows, k, "document").model_dump()
+                      for k in k_values},
+        "sections": {str(k): aggregate(section_rows, k, "chunk").model_dump()
+                     for k in k_values},
+        "supplied": supplied_summary,
+        "mean_estimated_tokens": round(sum(tokens) / len(tokens), 1) if tokens else 0.0,
+        "missed": missed,
+        "irrelevant": wrong,
+        "supplied_missed": supplied_missed,
+        "supplied_irrelevant": supplied_wrong,
+        # The four numbers the decision rule reads, gathered in one place so the
+        # rule cannot quietly be applied to a different set than the one shown.
+        "headline": {
+            "recall": supplied_summary["recall"],
+            "precision": supplied_summary["precision"],
+            "irrelevant": len(supplied_wrong),
+            "missed": len(supplied_missed),
+        },
+        "per_case": per_case,
+    }
+
+
+def _decide(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Apply the accept/reject rule to a before/after pair.
+
+    Judged on the **supplied** set -- the excerpts that reached the prompt under
+    the shipped budget -- because that is the only knowledge the model ever saw.
+    A note demoted to the bottom of an eight-slot result on a six-document
+    corpus is still "retrieved"; what changed is whether it was put in front of
+    the model, and that is the thing worth measuring.
+
+    The rule is fixed in advance and is deliberately asymmetric: a change that
+    trades precision away for recall is rejected outright, while a change that
+    trades recall away for precision is rejected unless the loss is small. A
+    retriever that supplies the wrong document confidently is worse than one
+    that supplies one fewer right document, because a person reading the output
+    cannot tell the first case from a correct answer.
+    """
+    first = before.get("headline", {})
+    second = after.get("headline", {})
+    recall_before, recall_after = first.get("recall"), second.get("recall")
+    prec_before, prec_after = first.get("precision"), second.get("precision")
+
+    if None in (recall_before, recall_after, prec_before, prec_after):
+        return {"verdict": "undecided",
+                "why": "a headline metric was undefined; nothing to compare"}
+
+    bad_before, bad_after = first.get("irrelevant", 0), second.get("irrelevant", 0)
+    missed_before, missed_after = first.get("missed", 0), second.get("missed", 0)
+    recall_delta = recall_after - recall_before
+    precision_delta = prec_after - prec_before
+    reasons = [
+        f"supplied recall {recall_before:.3f} -> {recall_after:.3f} ({recall_delta:+.3f})",
+        f"supplied precision {prec_before:.3f} -> {prec_after:.3f} "
+        f"({precision_delta:+.3f})",
+        f"irrelevant documents supplied {bad_before} -> {bad_after}",
+        f"relevant documents not supplied {missed_before} -> {missed_after}",
+    ]
+
+    # "Materially" is 0.05 of recall -- with eight cases that is closer to
+    # half a case than a whole one, so it cannot be reached by rounding.
+    if precision_delta < 0 or bad_after > bad_before:
+        verdict, why = "reject", ("precision fell or more irrelevant documents "
+                                  "were supplied")
+    elif recall_delta < -0.05:
+        verdict, why = "reject", "recall fell materially"
+    elif recall_delta <= 0 and precision_delta <= 0 and bad_after == bad_before:
+        verdict, why = "reject", "nothing measurably improved"
+    else:
+        verdict, why = "accept", ("precision and irrelevant-supply counts improved "
+                                  "without material recall loss")
+
+    return {"verdict": verdict, "why": why, "evidence": reasons,
+            "recall_delta": round(recall_delta, 4),
+            "precision_delta": round(precision_delta, 4),
+            "irrelevant_delta": bad_after - bad_before,
+            "missed_delta": missed_after - missed_before}
+
+
+def evaluate_variants(store: Any, embedder: Any,
+                      k_values: Sequence[int] = DEFAULT_K_VALUES) -> dict[str, Any]:
+    """Score every named configuration, then judge shipped against baseline."""
+    rows = [_variant_row(label, why, config, store, embedder, k_values)
+            for label, config, why in _variant_configs()]
+    by_label = {row["label"]: row for row in rows}
+    return {
+        "k_values": list(k_values),
+        "variants": rows,
+        "decision": _decide(by_label["baseline"], by_label["shipped"]),
+    }
+
+
+# ===========================================================================
+# Phase 4c -- named candidates, priced in tokens
+# ===========================================================================
+def _prompt_sizes(report: CaptureReport, knowledge: str | None) -> tuple[int, int]:
+    """``(characters, estimated tokens)`` of the whole request for one case.
+
+    The whole request, not the knowledge block: system prompt, framing, capture
+    JSON and knowledge together, measured through the same
+    :func:`~ai.prompts.build_messages` the analyzer calls, so the number is the
+    thing that gets sent rather than a model of it.
+
+    ``schema=None`` on purpose. Groq is a ``JSON_SCHEMA`` provider: the schema
+    travels in ``response_format``, not in the prompt. It is still metered, and
+    :func:`provider_schema_tokens` reports it separately rather than being
+    folded in here, where it would quietly inflate every provider's number.
+    """
+    from ai.llm_client import estimate_request_tokens
+    from ai.prompts import build_messages
+
+    messages = build_messages(report, None, knowledge)
+    characters = sum(len(message["content"]) for message in messages)
+    return characters, estimate_request_tokens(messages)
+
+
+def _capture_only_by_format(report: CaptureReport) -> dict[str, int]:
+    """Capture-only prompt size under each rendering, for the before/after."""
+    from ai.llm_client import estimate_request_tokens
+    from ai.prompts import CAPTURE_FORMATS, build_messages
+
+    return {name: estimate_request_tokens(build_messages(report, None, None, name))
+            for name in CAPTURE_FORMATS}
+
+
+def provider_schema_tokens() -> int:
+    """Estimated size of the JSON Schema Groq is sent alongside the prompt.
+
+    Measured, not assumed: a request to a ``JSON_SCHEMA`` provider carries this
+    in addition to everything :func:`_prompt_sizes` counts, so a token budget
+    that ignores it is short by exactly this much.
+    """
+    from ai.llm_client import estimate_request_tokens
+    from ai.providers import to_strict_json_schema
+    from ai.schemas import AnalysisResult
+
+    body = json.dumps(to_strict_json_schema(AnalysisResult.model_json_schema()),
+                      sort_keys=True)
+    return estimate_request_tokens([{"role": "system", "content": body}])
+
+
+def _account_for(candidate: Candidate, store: Any, embedder: Any,
+                 k: int = HEADLINE_K) -> CandidateAccount:
+    """Run every case under one candidate and total up what it did and cost."""
+    from ai.rag.context import KnowledgeContextConfig, build_knowledge_context
+    from ai.rag.retrieval import RetrievalConfig
+
+    retrieval_config = RetrievalConfig(**dict(candidate.retrieval))
+    budget = KnowledgeContextConfig(**dict(candidate.budget))
+    # Counted once, not per case: it is the same schema every time, and it is
+    # metered by the provider exactly like the prompt.
+    alongside = provider_schema_tokens()
+
+    accounts: list[CaseAccount] = []
+    retrieval_rows: list[RetrievalMetrics] = []
+    supplied_rows: list[RetrievalMetrics] = []
+
+    for case in CASES:
+        report = case.report()
+        if report is None:
+            continue
+
+        retrieval = _retrieve(case, report, store, embedder, retrieval_config)
+        context = build_knowledge_context(retrieval, budget)
+        documents = tuple(dict.fromkeys(_document_ranking(retrieval.chunks)))
+        supplied = tuple(dict.fromkeys(item.document_id for item in context.items))
+
+        knowledge_text = context.text or None
+        prompt_chars, prompt_tokens = _prompt_sizes(report, knowledge_text)
+        _, capture_only = _prompt_sizes(report, None)
+
+        retrieval_rows.append(score_ranking(list(documents), case.relevant_documents,
+                                            k, "document", case.irrelevant_documents))
+        # Scored at the number of excerpts this budget may supply, so precision
+        # is not penalised for slots the configuration never offered.
+        supplied_rows.append(score_ranking(list(supplied), case.relevant_documents,
+                                           budget.max_items, "document",
+                                           case.irrelevant_documents))
+
+        accounts.append(CaseAccount(
+            case_id=case.case_id,
+            retrieved_documents=documents,
+            supplied_documents=supplied,
+            relevant=frozenset(case.relevant_documents),
+            irrelevant=frozenset(case.irrelevant_documents),
+            knowledge_chars=context.total_chars,
+            knowledge_tokens=context.estimated_tokens,
+            prompt_chars=prompt_chars,
+            prompt_tokens=prompt_tokens,
+            capture_only_tokens=capture_only,
+            excluded_by_budget=context.dropped_items,
+            alongside_tokens=alongside,
+        ))
+
+    return CandidateAccount(
+        candidate=candidate,
+        cases=tuple(accounts),
+        retrieval_metrics=aggregate(retrieval_rows, k, "document").model_dump(),
+        supplied_metrics=aggregate(supplied_rows, budget.max_items,
+                                   "document").model_dump(),
+    )
+
+
+#: Cases the step 9 analysis singled out, watched individually here.
+WATCHED_CASES: tuple[str, ...] = (
+    "normal-cdn-multi-host", "unknown-application", "real-capture-benign",
+    "knowledge-conflicts-observation", "dns-tunneling", "two-documents-relevant",
+)
+
+
+def evaluate_candidates(store: Any, embedder: Any) -> dict[str, Any]:
+    """Score every named candidate and apply the selection rule."""
+    accounts = [_account_for(candidate, store, embedder) for candidate in CANDIDATES]
+    selection = rank(accounts)
+
+    watched: dict[str, dict[str, Any]] = {}
+    for account in accounts:
+        for case in account.cases:
+            if case.case_id in WATCHED_CASES:
+                watched.setdefault(case.case_id, {})[account.candidate.name] = {
+                    "supplied": list(case.supplied_documents),
+                    "never_retrieved": list(case.never_retrieved),
+                    "lost_before_prompt": list(case.lost_before_prompt),
+                    "irrelevant_supplied": list(case.irrelevant_supplied),
+                    "prompt_tokens": case.prompt_tokens,
+                    "knowledge_tokens": case.knowledge_tokens,
+                }
+
+    return {
+        "observed_failing_prompt_tokens": OBSERVED_FAILING_PROMPT_TOKENS,
+        "provider_schema_tokens": provider_schema_tokens(),
+        "candidates": [account.as_dict() for account in accounts],
+        "selection": selection,
+        "watched_cases": watched,
     }
 
 
@@ -687,7 +1175,10 @@ def run(live: bool = False) -> dict[str, Any]:
             } for case in CASES],
         },
         "signals": evaluate_signals(),
+        "request_size": evaluate_request_size(),
         "retrieval": None,
+        "variants": None,
+        "candidates": None,
         "budget": None,
         "thresholds": None,
         "live": None,
@@ -698,6 +1189,8 @@ def run(live: bool = False) -> dict[str, Any]:
         store, embedder, chunk_count = build_index()
     except IndexUnavailable as exc:
         result["index"] = {"available": False, "reason": str(exc)}
+        result["variants"] = {"skipped": f"the knowledge index is unavailable: {exc}"}
+        result["candidates"] = {"skipped": f"the knowledge index is unavailable: {exc}"}
         result["recommendations"] = recommend(None, None, None)
         # The live pass needs the same index, so it cannot run either.  Saying
         # so is better than leaving the section null and letting a reader guess.
@@ -707,6 +1200,8 @@ def run(live: bool = False) -> dict[str, Any]:
     result["index"] = {"available": True, "chunks": chunk_count,
                        "dimension": store.dimension, "model": store.model_name}
     result["retrieval"] = evaluate_retrieval(store, embedder)
+    result["variants"] = evaluate_variants(store, embedder)
+    result["candidates"] = evaluate_candidates(store, embedder)
     result["budget"] = evaluate_budget(store, embedder)
     result["thresholds"] = evaluate_thresholds(store, embedder)
     result["recommendations"] = recommend(result["retrieval"], result["budget"],
@@ -770,6 +1265,8 @@ def render(result: dict[str, Any]) -> str:
         if row["additional_unlabelled"]:
             out.append(f"      also (unlabelled): {row['additional_unlabelled']}")
 
+    out.extend(_render_request_size(result["request_size"]))
+
     index = result["index"]
     if not index["available"]:
         out.append(_section("3-6. RETRIEVAL, BUDGET AND THRESHOLD SWEEPS"))
@@ -778,6 +1275,8 @@ def render(result: dict[str, Any]) -> str:
         out.append("  estimated. Install requirements-rag.txt and re-run.")
     else:
         out.extend(_render_retrieval(result["retrieval"]))
+        out.extend(_render_variants(result["variants"]))
+        out.extend(_render_candidates(result["candidates"]))
         out.extend(_render_budget(result["budget"]))
         out.extend(_render_thresholds(result["thresholds"]))
 
@@ -850,6 +1349,197 @@ def _render_retrieval(retrieval: dict[str, Any]) -> list[str]:
     out.append("\n  Section (chunk) level:")
     for summary in retrieval["section_summary"]:
         out.append("    " + MetricSummary(**summary).row())
+    return out
+
+
+def _render_variants(variants: dict[str, Any]) -> list[str]:
+    out = [_section("4b. BEFORE / AFTER  (same index, same context budget)")]
+    if "skipped" in variants:
+        out.append(f"  SKIPPED: {variants['skipped']}")
+        return out
+
+    out.append("  'supplied' is what the shipped context budget actually put in the")
+    out.append("  prompt; 'retrieved' is everything the ranking returned. A demotion")
+    out.append("  shows up in the first and usually not in the second, because on a")
+    out.append("  six-document corpus eight slots hold nearly all of it either way.")
+    out.append("")
+    out.append("      configuration      | supplied: recall  prec  irrel miss  ~tok "
+               "| retrieved: recall@8 prec@3 irrel")
+    for row in variants["variants"]:
+        sup = row["supplied"]
+        docs8, docs3 = row["documents"]["8"], row["documents"]["3"]
+        out.append(f"      {row['label']:<18} |           "
+                   f"{_show(sup['recall'], 3):>6} {_show(sup['precision'], 3):>5} "
+                   f"{row['headline']['irrelevant']:>5} "
+                   f"{row['headline']['missed']:>4} "
+                   f"{row['mean_estimated_tokens']:>5.0f} "
+                   f"|            {_show(docs8['recall'], 3):>7} "
+                   f"{_show(docs3['precision'], 3):>6} {len(row['irrelevant']):>5}")
+        out.append(f"        {row['why']}")
+
+    decision = variants["decision"]
+    out.append(f"\n  Decision rule (shipped vs baseline, on the supplied set): "
+               f"{decision['verdict'].upper()}")
+    out.append(f"    {decision['why']}")
+    for line in decision.get("evidence", []):
+        out.append(f"    {line}")
+
+    out.append("\n  Under the shipped configuration, cases where the supplied set is "
+               "still wrong:")
+    shipped = next(row for row in variants["variants"] if row["label"] == "shipped")
+    clean = True
+    for case in shipped["per_case"]:
+        if case["supplied_missed"] or case["supplied_irrelevant"]:
+            clean = False
+            out.append(f"    {case['case']:<34} not supplied={case['supplied_missed']} "
+                       f"irrelevant supplied={case['supplied_irrelevant']}")
+    if clean:
+        out.append("    none")
+    return out
+
+
+def _render_request_size(sizes: dict[str, Any]) -> list[str]:
+    out = [_section("2b. WHAT A REQUEST IS MADE OF  (no embedding model needed)")]
+    groq = sizes["response_format_tokens"].get("groq", 0)
+    failing = sizes["observed_failing_prompt_tokens"]
+    out.append(f"  Estimated tokens. A JSON_SCHEMA provider is sent the response schema")
+    out.append(f"  as well as the prompt: ~{groq} tokens that no context budget counts.")
+    out.append(f"  A request of ~{failing} tokens has been observed to fail live.")
+    first = next((row for row in sizes["cases"] if "skipped" not in row), None)
+    if first and "capture_by_format" in first:
+        out.append("  Capture rendering (prompt v2.0 lays the flows out as a table;")
+        out.append("  DPI_CAPTURE_FORMAT=json restores the previous layout):")
+        for row in sizes["cases"]:
+            if "skipped" in row:
+                continue
+            fmts = row["capture_by_format"]
+            saving = 1 - fmts["table"] / fmts["json"] if fmts["json"] else 0.0
+            out.append(f"      {row['case']:<34} json {fmts['json']:>5} -> "
+                       f"table {fmts['table']:>5} tokens  ({saving:.0%} smaller)")
+    out.append("")
+    ceilings = sizes["budget_ceilings"]
+    header = (f"      {'case':<34} {'flows':>5} {'capture':>8}"
+              + "".join(f"{'+' + str(c):>8}" for c in ceilings)
+              + "".join(f"{'+' + str(c) + '+sch':>12}" for c in ceilings))
+    out.append(header)
+    for row in sizes["cases"]:
+        if "skipped" in row:
+            out.append(f"      {row['case']:<34} skipped: {row['skipped']}")
+            continue
+        line = (f"      {row['case']:<34} {row['flows']:>5} "
+                f"{row['capture_only_tokens']:>8}")
+        line += "".join(f"{row['with_budget'][str(c)]:>8}" for c in ceilings)
+        for c in ceilings:
+            total = row["with_budget_and_schema"][str(c)]
+            line += f"{total:>11}{'!' if total >= failing else ' '}"
+        out.append(line)
+
+    out.append("")
+    for ceiling in ceilings:
+        low, high = sizes["knowledge_share_range"][str(ceiling)]
+        out.append(f"  At a {ceiling}-token ceiling the knowledge block is "
+                   f"{low * 100:.0f}%-{high * 100:.0f}% of the prompt;")
+        out.append("  the capture is the rest.")
+    out.append(f"  Largest capture-only request: "
+               f"~{sizes['largest_capture_only']} tokens.")
+    out.append("  Reading: the capture is still the larger term, so the knowledge")
+    out.append("  budget alone cannot decide whether a request is sendable. Prompt")
+    out.append("  v2.0 attacked the large term directly by laying the flows out as a")
+    out.append("  table instead of as pretty-printed JSON -- same flows, same fields,")
+    out.append("  same values, roughly half the tokens. --max-flows remains the only")
+    out.append("  other lever on this term, and it is the one that discards evidence.")
+    return out
+
+
+def _render_candidates(candidates: dict[str, Any]) -> list[str]:
+    out = [_section("4c. CANDIDATE CONFIGURATIONS, PRICED IN TOKENS")]
+    if "skipped" in candidates:
+        out.append(f"  SKIPPED: {candidates['skipped']}")
+        return out
+
+    failing = candidates["observed_failing_prompt_tokens"]
+    out.append(f"  A prompt of ~{failing} estimated tokens has been observed to fail")
+    out.append("  live (HTTP 413/429). That is one-sided evidence: it says this size")
+    out.append("  fails, not that anything smaller succeeds. It flags rows; it guards")
+    out.append("  nothing.")
+    out.append(f"  A JSON_SCHEMA provider (Groq) is additionally sent the response")
+    out.append(f"  schema, about {candidates['provider_schema_tokens']} estimated "
+               "tokens, which none of the")
+    out.append("  prompt figures below include.")
+    out.append("")
+    out.append("                 retrieval          |            supplied            | "
+               "         cost")
+    out.append("      name       recall  prec   MRR | recall  prec  lost irrel excl | "
+               "~know  ~max prompt  know%  ev/1k")
+    for row in candidates["candidates"]:
+        excluded = sum(case["excluded_by_budget"] for case in row["per_case"])
+        risk = " !" if row["cases_at_risk"] else "  "
+        out.append(
+            f"      {row['name']:<10} {_show(row['retrieval_recall'], 3):>6} "
+            f"{_show(row['retrieval_precision'], 3):>5} {_show(row['mrr'], 3):>5} | "
+            f"{_show(row['supplied_recall'], 3):>6} "
+            f"{_show(row['supplied_precision'], 3):>5} "
+            f"{row['lost_before_prompt']:>5} {row['irrelevant_supplied']:>5} "
+            f"{excluded:>4} | {row['mean_knowledge_tokens']:>5.0f} "
+            f"{row['max_request_tokens']:>11}{risk} "
+            f"{row['mean_knowledge_share'] * 100:>5.1f}% "
+            f"{_show(row['evidence_per_1k_tokens'], 3):>6}")
+        marker = "  (reference only)" if row["reference_only"] else ""
+        out.append(f"        {row['description']}{marker}")
+        out.append(f"        {row['configuration']}")
+
+    out.append("\n  lost  = relevant, retrieved, then dropped by the budget")
+    out.append("  irrel = labelled-irrelevant documents that reached the prompt")
+    out.append("  excl  = excerpts retrieval found and the budget could not afford")
+    out.append("  know% = share of the request the knowledge block accounts for")
+    out.append("  ev/1k = supplied recall per 1000 tokens of the LARGEST request")
+    out.append("  max request = largest prompt PLUS what the provider is sent "
+               "alongside it")
+    out.append("  !     = at least one case at or above a size observed to fail")
+
+    selection = candidates["selection"]
+    if not selection.get("size_axis_informative", True):
+        out.append(
+            f"\n  NOTE: the baseline's own largest request is "
+            f"~{selection.get('baseline_max_request_tokens')} tokens, already at or "
+            f"above the ~{failing} observed to fail. Request size therefore does not")
+        out.append("  separate these candidates, and none of them is thereby safe to")
+        out.append("  send. The term that would shrink a request is the capture "
+                   "(--max-flows),")
+        out.append("  not the knowledge budget.")
+    out.append(f"\n  Selection rule (against {selection['baseline']}, "
+               f"ev/1k {_show(selection['baseline_score'], 3)}):")
+    for verdict in selection["verdicts"]:
+        mark = "ADMISSIBLE" if verdict["admissible"] else "rejected  "
+        out.append(f"    {mark}  {verdict['name']:<10} ev/1k="
+                   f"{_show(verdict['score'], 3)}")
+        for reason in verdict["reasons"]:
+            out.append(f"        {reason}")
+    recommended = selection["recommended"]
+    out.append(f"\n  RECOMMENDED CANDIDATE: {recommended or 'none -- keep the shipped defaults'}")
+    out.append(f"  {selection['note']}")
+
+    out.append("\n  Watched cases, by candidate:")
+    for case_id in WATCHED_CASES:
+        rows = candidates["watched_cases"].get(case_id)
+        if not rows:
+            out.append(f"    {case_id:<34} (capture unavailable)")
+            continue
+        out.append(f"    {case_id}")
+        for name in [row["name"] for row in candidates["candidates"]]:
+            entry = rows.get(name)
+            if entry is None:
+                continue
+            problems = []
+            if entry["never_retrieved"]:
+                problems.append(f"never retrieved {entry['never_retrieved']}")
+            if entry["lost_before_prompt"]:
+                problems.append(f"lost to budget {entry['lost_before_prompt']}")
+            if entry["irrelevant_supplied"]:
+                problems.append(f"irrelevant {entry['irrelevant_supplied']}")
+            out.append(f"      {name:<10} {len(entry['supplied'])} supplied, "
+                       f"~{entry['prompt_tokens']} prompt tokens"
+                       + (f"  -- {'; '.join(problems)}" if problems else "  -- clean"))
     return out
 
 
@@ -950,12 +1640,99 @@ LIMITATIONS: tuple[str, ...] = (
     "single problem may not reproduce.",
     "min_similarity is swept against this dataset only. A threshold that loses "
     "nothing here may discard useful knowledge on a capture unlike these.",
+    "OBSERVED_FAILING_PROMPT_TOKENS is one-sided evidence. A request of that "
+    "size failed live; nothing here establishes that a smaller one succeeds, "
+    "and the real limit is a property of the provider account rather than of "
+    "this code. It flags rows in a report and guards nothing.",
+    "Token figures throughout are the 3.5-characters-per-token estimate, which "
+    "runs high against a real tokenizer. That is the safe direction for a size "
+    "warning and the wrong direction for a size guarantee: a candidate shown as "
+    "fitting is not thereby proven to fit.",
+    "The candidate table prices the whole request but scores knowledge only. "
+    "Nothing in it measures whether a supplied excerpt changed the model's "
+    "answer -- that is the live grounding pass, at one sample per case.",
+    "The compatibility tier reads each document's hand-written applies_to list. "
+    "It is only as good as that declaration: a document whose author forgot to "
+    "list a signal it genuinely covers will be ranked below one that remembered, "
+    "and no metric here can tell that from a correct demotion.",
+    "The before/after table judges the supplied set under one fixed budget. A "
+    "ranking change that only reorders excerpts already inside the budget is "
+    "invisible to it, which is intended -- but it also means the table says "
+    "nothing about how the ranking would behave at a larger budget.",
     "No latency or cost measurement. Retrieval is sub-millisecond at this "
     "corpus size and was not the question.",
 )
 
 
 # ===========================================================================
+def _emit(text: str, path: str | None, json_mode: bool) -> int:
+    """Deliver the report, and make the delivery itself trustworthy.
+
+    Writing the file here rather than leaving it to the shell is not a
+    convenience. ``python run_rag_evaluation.py --json > out.json`` in Windows
+    PowerShell 5.1 goes through ``Out-File``, whose default encoding is
+    UTF-16LE **with a byte-order mark** -- so a perfectly good JSON document
+    arrives on disk as ``ff fe 7b 00 ...`` and ``json.load(open(path))`` fails
+    with ``Expecting value: line 1 column 1 (char 0)``. The program was right,
+    the file was wrong, and nothing in the error said so.
+
+    ``--out`` removes the shell from the path: the file is written UTF-8, no
+    BOM, ``\n`` line endings, and in JSON mode it is read back and parsed
+    before this function returns. A file this reports as written has been
+    proven to parse.
+    """
+    if path is None:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+        if json_mode:
+            encoding = (getattr(sys.stdout, "encoding", "") or "").lower()
+            if encoding.replace("-", "") not in ("utf8", ""):
+                print(f"note: stdout is {encoding}; if you are redirecting to a "
+                      "file, prefer --out PATH, which always writes UTF-8.",
+                      file=sys.stderr)
+        return 0
+
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text + "\n")
+
+    if json_mode:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"error: wrote {path} but it does not parse as JSON: {exc}",
+                  file=sys.stderr)
+            return 1
+        print(f"wrote {path} ({os.path.getsize(path)} bytes, UTF-8, verified "
+              "to parse as JSON)", file=sys.stderr)
+    else:
+        print(f"wrote {path} ({os.path.getsize(path)} bytes, UTF-8)",
+              file=sys.stderr)
+    return 0
+
+
+def _failure_document(exc: BaseException) -> dict[str, Any]:
+    """What JSON mode emits when the run itself fell over.
+
+    An empty file and a traceback on a stream the user redirected away is the
+    worst of both worlds: nothing to read and nothing to parse. A machine-
+    readable mode that cannot report its own failure machine-readably is not
+    machine-readable, so a crash produces a valid document that says so, and
+    the exit status is non-zero.
+    """
+    return {
+        "error": {
+            "type": type(exc).__name__,
+            "detail": _redact(str(exc)),
+            "traceback": _redact(traceback.format_exc()),
+        },
+        "dataset": None, "signals": None, "request_size": None, "retrieval": None,
+        "variants": None, "candidates": None, "budget": None, "thresholds": None,
+        "live": None, "recommendations": None,
+        "index": {"available": False, "reason": "the evaluation raised before finishing"},
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Evaluate the RAG + AI analysis pipeline.")
@@ -963,21 +1740,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="emit machine-readable JSON instead of the report")
     parser.add_argument("--live", action="store_true",
                         help="also run a small live-LLM grounding pass (uses quota)")
+    parser.add_argument("--out", metavar="PATH", default=None,
+                        help="write the output to PATH as UTF-8 (no BOM) and, in "
+                             "--json mode, verify it parses. Prefer this over shell "
+                             "redirection on Windows, where PowerShell's '>' writes "
+                             "UTF-16 and the resulting file will not load.")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    # Corpus loading and index construction print progress; keep the report clean.
-    buffer = io.StringIO()
-    with redirect_stdout(buffer):
-        result = run(live=args.live)
+    # Corpus loading, index construction and sentence-transformers all print
+    # progress to stdout.  It is captured here and released to stderr, so that
+    # stdout carries the document and nothing else -- which is what makes
+    # `--json` safe to redirect.
+    progress = io.StringIO()
+    try:
+        with redirect_stdout(progress):
+            result = run(live=args.live)
+    except BaseException as exc:  # noqa: BLE001 - reported, never swallowed
+        noise = progress.getvalue()
+        if noise:
+            sys.stderr.write(noise)
+        traceback.print_exc(file=sys.stderr)
+        if args.json:
+            document = _redact(json.dumps(_failure_document(exc), indent=2,
+                                          sort_keys=True, default=str))
+            _emit(document, args.out, json_mode=True)
+        else:
+            _emit(f"EVALUATION FAILED\n\n  {type(exc).__name__}: {_redact(str(exc))}\n",
+                  args.out, json_mode=False)
+        return 1
+
+    noise = progress.getvalue()
+    if noise:
+        sys.stderr.write(noise)
 
     if args.json:
-        print(_redact(json.dumps(result, indent=2, sort_keys=True, default=str)))
-    else:
-        print(_redact(render(result)))
+        document = _redact(json.dumps(result, indent=2, sort_keys=True, default=str))
+        # Parse what is about to be emitted.  Cheap, and it means the contract
+        # "--json prints a JSON document" is checked rather than assumed.
+        json.loads(document)
+        return _emit(document, args.out, json_mode=True)
 
-    # A failing evaluation is information, not a broken program: exit 0 unless
-    # the harness itself could not run.
-    return 0
+    return _emit(_redact(render(result)), args.out, json_mode=False)
 
 
 if __name__ == "__main__":

@@ -46,3 +46,13 @@ htmlcov/
 # tracked; everything else this project writes is output and is not.
 *.pcap
 !test_dpi.pcap
+
+# ---- Evaluation output ----
+# run_rag_evaluation.py writes these; they are measurements of a particular
+# machine on a particular day, not source.  The numbers that matter are quoted
+# in the step reports, and a stale 650 KB result committed here would be
+# mistaken for the current one.
+step*.json
+step10-*.txt
+step*-debug.txt
+evaluation-*.json

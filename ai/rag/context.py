@@ -276,6 +276,21 @@ class KnowledgeItem(BaseModel):
     def matched_signal_types(self) -> tuple[SignalType, ...]:
         return self.retrieved.matched_signal_types
 
+    @property
+    def compatibility(self) -> str:
+        """How this excerpt's source document compared with the observed signals.
+
+        Reported, never rendered.  The prompt block is token-budgeted, and the
+        model has no use for a ranking decision that was already applied before
+        it saw anything -- but a person reading the console report, or a later
+        regression check, very much does.
+        """
+        return self.retrieved.compatibility.value
+
+    @property
+    def affinity_note(self) -> str:
+        return self.retrieved.affinity_note
+
     def citation(self) -> str:
         return self.retrieved.citation()
 
@@ -312,6 +327,8 @@ class KnowledgeItem(BaseModel):
             "similarity": round(self.similarity, 6),
             "citation": self.citation(),
             "matched_signal_types": [i.value for i in self.matched_signal_types],
+            "compatibility": self.compatibility,
+            "why_ranked": self.affinity_note,
             "licence": self.chunk.licence,
         }
 

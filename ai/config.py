@@ -19,6 +19,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Final
 
+from .prompts import CAPTURE_FORMATS, DEFAULT_CAPTURE_FORMAT
 from .providers import Provider, ProviderSpec, get_provider_spec, parse_provider
 
 __all__ = [
@@ -40,6 +41,12 @@ _ENV_MODEL: Final[str] = "DPI_AI_MODEL"
 _ENV_TIMEOUT: Final[str] = "DPI_AI_TIMEOUT"
 _ENV_MAX_RETRIES: Final[str] = "DPI_AI_MAX_RETRIES"
 _ENV_MAX_FLOWS: Final[str] = "DPI_AI_MAX_FLOWS"
+#: Overrides the provider's known per-request input ceiling.  ``0`` disables
+#: the check entirely, for an account whose real limit is not worth modelling.
+_ENV_MAX_INPUT_TOKENS: Final[str] = "DPI_MAX_INPUT_TOKENS"
+#: Selects how the capture is rendered into the prompt; see
+#: :data:`ai.prompts.CAPTURE_FORMATS`.  ``json`` restores the pre-2.0 layout.
+_ENV_CAPTURE_FORMAT: Final[str] = "DPI_CAPTURE_FORMAT"
 _ENV_IP_MODE: Final[str] = "DPI_AI_IP_MODE"
 _ENV_BASE_URL: Final[str] = "DPI_AI_BASE_URL"
 
@@ -110,6 +117,18 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_choice(name: str, allowed: tuple[str, ...], default: str) -> str:
+    """One of ``allowed`` from the environment, or the default.
+
+    An unrecognised value falls back rather than raising: a typo in an
+    environment variable must not stop a DPI analysis that never needed the
+    setting.  ``AIConfig.__post_init__`` still refuses a bad value passed in
+    code, where it is a programming error rather than a typo.
+    """
+    value = os.environ.get(name, "").strip().lower()
+    return value if value in allowed else default
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ[name])
@@ -134,6 +153,15 @@ class AIConfig:
     max_retries: int = DEFAULT_MAX_RETRIES
     max_flows: int = DEFAULT_MAX_FLOWS
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+    #: Largest request worth sending, in estimated input tokens. ``None``
+    #: disables the check. Resolved from the provider spec unless overridden;
+    #: see :attr:`ai.providers.ProviderSpec.max_input_tokens`.
+    max_input_tokens: int | None = None
+    #: How the capture is laid out for the model.  ``"table"`` by default; see
+    #: :data:`ai.prompts.CAPTURE_FORMATS` for why, and for how to get the old
+    #: layout back.  Changing this changes only the rendering -- the
+    #: :class:`~ai.schemas.CaptureReport` itself is identical either way.
+    capture_format: str = DEFAULT_CAPTURE_FORMAT
     ip_mode: IPRedactionMode = IPRedactionMode.REDACT_PRIVATE
     #: Deterministic generation, so evaluation later is meaningful.
     temperature: float = 0.0
@@ -144,8 +172,22 @@ class AIConfig:
     def __post_init__(self) -> None:
         # Fill the model from the provider default only if nothing was given,
         # so an explicit model always wins.
+        spec = get_provider_spec(self.provider)
         if not self.model:
-            self.model = get_provider_spec(self.provider).default_model
+            self.model = spec.default_model
+        # Likewise the request ceiling: an explicit value always wins, and the
+        # provider's own known limit is the fallback. A caller that genuinely
+        # wants no ceiling passes 0, which reads as "unlimited" here and is
+        # normalised to None so there is only one way to express it.
+        if self.max_input_tokens is None:
+            self.max_input_tokens = spec.max_input_tokens
+        elif self.max_input_tokens <= 0:
+            self.max_input_tokens = None
+        if self.capture_format not in CAPTURE_FORMATS:
+            raise ValueError(
+                f"capture_format must be one of {list(CAPTURE_FORMATS)}, "
+                f"got {self.capture_format!r}"
+            )
 
     # ------------------------------------------------------------------
     @property
@@ -226,6 +268,10 @@ class AIConfig:
             timeout_seconds=_env_float(_ENV_TIMEOUT, DEFAULT_TIMEOUT_SECONDS),
             max_retries=_env_int(_ENV_MAX_RETRIES, DEFAULT_MAX_RETRIES),
             max_flows=_env_int(_ENV_MAX_FLOWS, DEFAULT_MAX_FLOWS),
+            max_input_tokens=_env_int(_ENV_MAX_INPUT_TOKENS,
+                                      spec.max_input_tokens or 0) or None,
+            capture_format=_env_choice(_ENV_CAPTURE_FORMAT, CAPTURE_FORMATS,
+                                       DEFAULT_CAPTURE_FORMAT),
             ip_mode=ip_mode,
             invalid_provider=invalid,
         )

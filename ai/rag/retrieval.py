@@ -56,6 +56,7 @@ from typing import Final, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .affinity import TIER, AffinityMode, Compatibility, SignalAffinity, assess
 from .chunking import KnowledgeChunk
 from .documents import Category
 from .embeddings import EmbeddingModel
@@ -65,6 +66,8 @@ from .vector_store import VectorStore
 __all__ = [
     "BGE_QUERY_PREFIX",
     "CAPTURE_QUERY_LABEL",
+    "DEFAULT_QUERY_STYLE",
+    "QUERY_LEAD_IN",
     "QUERY_TEMPLATES",
     "RETRIEVAL_SCHEMA_VERSION",
     "ModelMismatchError",
@@ -116,6 +119,46 @@ class ModelMismatchError(RetrievalError):
     cosine scores between them are arithmetic without meaning -- so this is
     refused rather than ranked.
     """
+
+
+# ===========================================================================
+# Query framing
+# ===========================================================================
+#: How every query opens.  The same words prefix every query, so the choice
+#: does not distinguish one query from another -- it shifts *all* of them
+#: together, toward or away from a region of the corpus.
+#:
+#: ``"security"`` is the original wording.  Six of six documents in this corpus
+#: are network-security notes, but they are not equally *about* security: a
+#: glossary, a protocol description and a benign-traffic baseline are written
+#: in descriptive language, while an attack pattern and a detection heuristic
+#: are written in the vocabulary of threats.  Opening every query with
+#: "Network security knowledge about" therefore leans every query, including
+#: the ones about ordinary browsing, toward the threat-shaped half of the
+#: corpus.
+#:
+#: ``"topical"`` states what is wanted -- reference notes on a subject --
+#: without naming a stance.  That was the argument for changing it, and step 9
+#: shipped it as the default on the strength of the argument.
+#:
+#: **Then it was measured, and it did not pay.**  Against the real
+#: ``bge-small-en-v1.5`` index, the neutral wording moved nothing the
+#: supplied-set decision rule cares about, so the default is back to
+#: ``"security"`` -- the wording every number from step 8 onward was measured
+#: with.  ``"topical"`` remains selectable, because a well-argued change that
+#: did not help on eight cases is a candidate worth re-measuring on a larger
+#: corpus, not a mistake worth deleting.
+#:
+#: The lesson is recorded here rather than in a commit message: a query-framing
+#: argument that sounds right is worth exactly one experiment.
+QUERY_LEAD_IN: Final[dict[str, str]] = {
+    "topical": "Reference notes about: ",
+    "security": "Network security knowledge about: ",
+}
+
+#: The shipped wording.  Changed to ``"topical"`` in step 9 and changed back in
+#: step 10 when the measurement came in.
+DEFAULT_QUERY_STYLE: Final[str] = "security"
 
 
 # ===========================================================================
@@ -221,10 +264,38 @@ class RetrievalConfig:
     #: Most chunks one document may contribute to the final result; ``None``
     #: disables the cap.  Without it a single long document can occupy every
     #: slot, since its sections are all similar to the same query.
+    #:
+    #: Two, unchanged.  Tightening it to one puts more *distinct* documents in
+    #: the result, which sounds like an improvement and is not unambiguously
+    #: one: with six documents and eight slots, a cap of one fills the result
+    #: with the entire corpus, irrelevant notes included.  It is measured as a
+    #: candidate by ``run_rag_evaluation.py`` rather than adopted on the
+    #: strength of the phrase "less duplication".
     max_per_document: int | None = 2
 
     #: Include the capture-wide profile query alongside the per-signal ones.
     include_capture_query: bool = True
+
+    #: Whether signal/knowledge compatibility takes part in ranking.  See
+    #: :mod:`ai.rag.affinity`.
+    #:
+    #: ``OFF``, on measured evidence rather than on the argument for it.  The
+    #: mechanism does what it was designed to do -- it classifies every one of
+    #: the eight evaluation cases the way the hand-written labels do, which
+    #: ``run_rag_quality_tests.py`` still asserts -- but classifying correctly
+    #: and *changing the outcome* are different claims, and only the second one
+    #: matters.  Measured against the real index under the supplied-set decision
+    #: rule, it did not beat the baseline, so it does not ship enabled.
+    #:
+    #: It is kept, whole and tested, as an experimental candidate: six documents
+    #: and eight slots is a corpus small enough that nearly everything is
+    #: retrieved either way, which is exactly the regime in which a re-ranking
+    #: policy has the least room to help.  Enable it with
+    #: ``RetrievalConfig(affinity=AffinityMode.RANK)``.
+    affinity: AffinityMode = AffinityMode.OFF
+
+    #: Which lead-in every query opens with; a key of :data:`QUERY_LEAD_IN`.
+    query_style: str = DEFAULT_QUERY_STYLE
 
     def __post_init__(self) -> None:
         if self.per_query_top_k < 0:
@@ -237,6 +308,16 @@ class RetrievalConfig:
             raise ValueError(
                 f"min_similarity must be within [-1, 1], got {self.min_similarity}"
             )
+        if self.query_style not in QUERY_LEAD_IN:
+            raise ValueError(
+                f"query_style must be one of {sorted(QUERY_LEAD_IN)}, "
+                f"got {self.query_style!r}"
+            )
+
+    @property
+    def lead_in(self) -> str:
+        """The opening words every query built under this config carries."""
+        return QUERY_LEAD_IN[self.query_style]
 
     def as_dict(self) -> dict[str, float | int | bool | str]:
         """Parameters used, for the report -- so a result can be reproduced."""
@@ -248,6 +329,8 @@ class RetrievalConfig:
             "max_per_document": "none" if self.max_per_document is None
             else self.max_per_document,
             "include_capture_query": self.include_capture_query,
+            "affinity": self.affinity.value,
+            "query_style": self.query_style,
         }
 
 
@@ -311,14 +394,15 @@ def _assert_no_capture_text(text: str, label: str) -> None:
         )
 
 
-def _signal_query(signal: Signal) -> SignalQuery:
+def _signal_query(signal: Signal, lead_in: str = QUERY_LEAD_IN[DEFAULT_QUERY_STYLE]
+                  ) -> SignalQuery:
     """Build the query for one signal.
 
     Three deterministic lines: the topic to retrieve, the observation that
     triggered it, and the numbers behind it.
     """
     lines = [
-        f"Network security knowledge about: {QUERY_TEMPLATES[signal.signal_type]}.",
+        f"{lead_in}{QUERY_TEMPLATES[signal.signal_type]}.",
         f"Observed: {signal.summary}",
     ]
     measurements = _render_measurements(signal.evidence)
@@ -338,7 +422,8 @@ def _signal_query(signal: Signal) -> SignalQuery:
     )
 
 
-def _capture_query(report: SignalReport) -> SignalQuery:
+def _capture_query(report: SignalReport,
+                   lead_in: str = QUERY_LEAD_IN[DEFAULT_QUERY_STYLE]) -> SignalQuery:
     """Build the one capture-wide query.
 
     Carries the profile -- protocols, ports, verdicts -- which no individual
@@ -357,9 +442,9 @@ def _capture_query(report: SignalReport) -> SignalQuery:
                       for signal in report.signals)
 
     lines = [
-        "Network security knowledge about: the overall shape of a captured traffic "
-        "sample, protocol and port distribution, and what a deep packet inspection "
-        "engine can conclude from flow metadata alone.",
+        f"{lead_in}the overall shape of a captured traffic sample, protocol and "
+        "port distribution, and what a deep packet inspection engine can "
+        "conclude from flow metadata alone.",
         f"Flows: {report.flow_count}.",
     ]
     if protocols:
@@ -394,9 +479,9 @@ def build_queries(
     query text can be inspected and tested with nothing installed.
     """
     cfg = config or RetrievalConfig()
-    queries = [_signal_query(signal) for signal in report.signals]
+    queries = [_signal_query(signal, cfg.lead_in) for signal in report.signals]
     if cfg.include_capture_query and report.flow_count > 0:
-        queries.append(_capture_query(report))
+        queries.append(_capture_query(report, cfg.lead_in))
     return tuple(queries)
 
 
@@ -476,6 +561,25 @@ class RetrievedChunk(BaseModel):
     )
     per_query_similarity: dict[str, float] = Field(
         min_length=1, description="Query label -> score, for auditing the merge."
+    )
+
+    # -- compatibility (see ai.rag.affinity) --------------------------------
+    #
+    # These record a ranking decision; they never alter ``similarity``, which
+    # remains the cosine score the index returned.  The defaults describe a
+    # chunk nothing was said about, so a caller that constructs a
+    # ``RetrievedChunk`` by hand gets neutral, similarity-only behaviour.
+    compatibility: Compatibility = Field(
+        default=Compatibility.UNSCOPED,
+        description="How the source document's applies_to compared with the signals.",
+    )
+    affinity_tier: int = Field(
+        default=TIER[Compatibility.UNSCOPED], ge=0,
+        description="Primary sort key; lower ranks first. Equal for all when affinity is off.",
+    )
+    affinity_note: str = Field(
+        default="", max_length=300,
+        description="Why this result was ranked where it was. Empty when nothing was applied.",
     )
 
     # -- validators ---------------------------------------------------------
@@ -595,6 +699,9 @@ class RetrievedChunk(BaseModel):
             "similarity": self.similarity,
             "matched_signal_types": [item.value for item in self.matched_signal_types],
             "matched_query_labels": list(self.matched_query_labels),
+            "compatibility": self.compatibility.value,
+            "affinity_tier": self.affinity_tier,
+            "affinity_note": self.affinity_note,
             "licence": self.licence,
         }
 
@@ -634,11 +741,13 @@ class RetrievalReport(BaseModel):
         if [chunk.rank for chunk in self.chunks] != list(range(len(self.chunks))):
             raise ValueError("ranks must be contiguous and start at zero")
 
-        keys = [(-round(chunk.similarity, 12), chunk.chunk_id) for chunk in self.chunks]
+        keys = [(chunk.affinity_tier, -round(chunk.similarity, 12), chunk.chunk_id)
+                for chunk in self.chunks]
         if keys != sorted(keys):
             raise ValueError(
                 "chunks are not in the documented order "
-                "(similarity descending, then chunk_id ascending)"
+                "(compatibility tier ascending, then similarity descending, "
+                "then chunk_id ascending)"
             )
 
         labels = {query.label for query in self.queries}
@@ -724,9 +833,17 @@ def retrieve_for_signals(
     a chunk for being a precise answer to exactly one signal.  Every query that
     found it is recorded, so a later step can say *why* a chunk is present.
 
-    **Ranking.**  Similarity descending, then ``chunk_id`` ascending -- the same
-    rule :class:`~ai.rag.vector_store.VectorStore` uses, so the merged order is
-    an extension of the per-query order rather than a second, different policy.
+    **Ranking.**  Compatibility tier ascending, then similarity descending, then
+    ``chunk_id`` ascending.  The last two are the rule
+    :class:`~ai.rag.vector_store.VectorStore` uses, so within a tier the merged
+    order is an extension of the per-query order rather than a second, different
+    policy.  The tier comes from :mod:`ai.rag.affinity` and separates notes that
+    declare a signal this capture produced from notes that declare signals it did
+    not: cosine cannot tell "about the same subject" from "appropriate for this
+    traffic", and a threshold on cosine cannot either.  Nothing is removed by it,
+    no score is altered by it, and every result carries the sentence explaining
+    where it landed.  ``RetrievalConfig(affinity=AffinityMode.OFF)`` restores
+    similarity-only ranking.
 
     **Diversity.**  At most ``max_per_document`` chunks from any one document,
     applied after ranking and before truncation, because a single long document
@@ -783,8 +900,29 @@ def retrieve_for_signals(
     if not best:
         notes.append("No chunk met the retrieval criteria.")
 
+    # -- compatibility ------------------------------------------------------
+    # Assessed over the whole merged pool, before anything is discarded, so a
+    # compatible chunk that similarity alone would have ranked twelfth can
+    # still reach the final result.  Applying it after truncation would only
+    # reorder what was already kept, which is not where the problem is.
+    fired = tuple(sorted(signal.signal_type.value for signal in report.signals))
+    neutral = SignalAffinity(
+        compatibility=Compatibility.UNSCOPED,
+        tier=TIER[Compatibility.UNSCOPED],
+        declared_matches=(), declared_scope=(), note="",
+    )
+    if cfg.affinity is AffinityMode.RANK:
+        affinities = {chunk_id: assess(chunks[chunk_id].applies_to, fired)
+                      for chunk_id in best}
+    else:
+        affinities = {chunk_id: neutral for chunk_id in best}
+
     # -- rank, then cap per document, then truncate -------------------------
-    ordered = sorted(best, key=lambda chunk_id: (-round(best[chunk_id], 12), chunk_id))
+    ordered = sorted(
+        best,
+        key=lambda chunk_id: (affinities[chunk_id].tier,
+                              -round(best[chunk_id], 12), chunk_id),
+    )
 
     selected: list[str] = []
     per_document: dict[str, int] = {}
@@ -810,6 +948,16 @@ def retrieve_for_signals(
             f"{len(ordered)} chunk(s) matched; the top {len(selected)} are included."
         )
 
+    if cfg.affinity is AffinityMode.RANK:
+        demoted = sum(1 for chunk_id in selected
+                      if affinities[chunk_id].compatibility is Compatibility.UNDECLARED)
+        if demoted:
+            notes.append(
+                f"{demoted} of the included chunk(s) come from notes that declare no "
+                "signal this capture produced; they were ranked after the compatible "
+                "ones rather than removed."
+            )
+
     results: list[RetrievedChunk] = []
     for rank, chunk_id in enumerate(selected):
         labels = tuple(sorted(per_query[chunk_id]))
@@ -817,6 +965,7 @@ def retrieve_for_signals(
             SignalType(label.split(":", 1)[1])
             for label in labels if label != CAPTURE_QUERY_LABEL
         )
+        affinity = affinities[chunk_id]
         results.append(
             RetrievedChunk(
                 chunk=chunks[chunk_id],
@@ -825,6 +974,9 @@ def retrieve_for_signals(
                 matched_signal_types=signal_types,
                 matched_query_labels=labels,
                 per_query_similarity={label: per_query[chunk_id][label] for label in labels},
+                compatibility=affinity.compatibility,
+                affinity_tier=affinity.tier,
+                affinity_note=affinity.note,
             )
         )
 
