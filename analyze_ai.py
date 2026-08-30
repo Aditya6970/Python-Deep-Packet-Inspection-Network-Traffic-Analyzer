@@ -257,7 +257,12 @@ def main(argv: list[str] | None = None) -> int:
             if knowledge_text is None:
                 print(f"\n[no reference knowledge: {rag_outcome.status.value} -- "
                       f"{rag_outcome.describe()}]")
-        messages = build_messages(report, None, knowledge_text)
+        # The capture format comes from the same config the analyzer uses, so
+        # this preview shows the layout that would actually be sent.  Passing
+        # the default instead made --show-payload silently disagree with the
+        # real request whenever DPI_CAPTURE_FORMAT was set to json.
+        messages = build_messages(report, None, knowledge_text,
+                                  ai_config.capture_format)
         print("\n===== EXACTLY WHAT WOULD BE SENT =====\n")
         for m in messages:
             print(f"--- role: {m['role']} ---")

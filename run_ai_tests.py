@@ -789,6 +789,128 @@ def test_provider_failures() -> None:
           "OUTPUT FORMAT" not in groq_fake.last_messages[0]["content"])
 
 
+def _payload_capture_block(text: str) -> str:
+    """The capture block out of a --show-payload dump."""
+    return text.split("===== BEGIN CAPTURE DATA =====")[1].split(
+        "===== END CAPTURE DATA =====")[0]
+
+
+def _flow_ids(block: str, capture_format: str) -> set[int]:
+    """Flow ids the block carries, whichever layout rendered them."""
+    import re as _re
+
+    if capture_format == "json":
+        return {int(v) for v in _re.findall(r'"flow_id":\s*(\d+)', block)}
+    rows = block.split("===== BEGIN FLOWS =====\n")[1].split(
+        "\n===== END FLOWS")[0].splitlines()
+    index = rows[0].split("|").index("flow_id")
+    return {int(row.split("|")[index]) for row in rows[1:]}
+
+
+def test_show_payload_capture_format() -> None:
+    """--show-payload must render the capture the way the request would.
+
+    The preview and the request are built by two different call sites, and
+    before this test they disagreed: the CLI called ``build_messages`` without
+    a capture format, so it always rendered the table even when
+    ``DPI_CAPTURE_FORMAT=json`` was configured. A flag whose whole purpose is
+    to show "exactly what would be sent" was showing something else.
+
+    So this checks the rendered bytes, not that a function was called with an
+    argument: it runs the real CLI under each setting and compares what it
+    printed against what the analyzer actually hands the provider.
+    """
+    print("\nStep 13 - --show-payload honours the configured capture format")
+
+    import analyze_ai
+    from ai.analyzer import analyze_capture
+    from ai.config import AIConfig
+    from ai.extractor import build_capture_report
+    from ai.llm_client import FakeLLMClient
+    from ai.prompts import CAPTURE_FORMATS, build_messages
+
+    if not PCAP.is_file():
+        skip("--show-payload renders the configured capture format",
+             "test_dpi.pcap is not present")
+        return
+
+    previous = os.environ.get("DPI_CAPTURE_FORMAT")
+    printed: dict[str, str] = {}
+    try:
+        for capture_format in CAPTURE_FORMATS:
+            os.environ["DPI_CAPTURE_FORMAT"] = capture_format
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                code = analyze_ai.main(
+                    ["analyze_ai.py", str(PCAP), "--show-payload", "--no-rag"])
+            check(f"--show-payload exits zero with capture_format={capture_format}",
+                  code == 0, str(code))
+            printed[capture_format] = buffer.getvalue()
+    finally:
+        if previous is None:
+            os.environ.pop("DPI_CAPTURE_FORMAT", None)
+        else:
+            os.environ["DPI_CAPTURE_FORMAT"] = previous
+
+    table_block = _payload_capture_block(printed["table"])
+    json_block = _payload_capture_block(printed["json"])
+
+    # -- the two layouts are actually different, and each is the right one ---
+    check("the table setting previews the table layout",
+          "===== BEGIN FLOWS =====" in table_block
+          and '"flow_id":' not in table_block)
+    check("the json setting previews the json layout",
+          '"flow_id":' in json_block
+          and "===== BEGIN FLOWS =====" not in json_block,
+          json_block[:60])
+    check("the two previews are not the same text",
+          table_block != json_block)
+
+    # -- and neither loses a flow -------------------------------------------
+    ids_table = _flow_ids(table_block, "table")
+    ids_json = _flow_ids(json_block, "json")
+    check("both layouts preview every flow, and the same ones",
+          ids_table == ids_json and len(ids_table) > 0,
+          f"{len(ids_table)} vs {len(ids_json)}")
+
+    # -- the preview equals what the request would carry ---------------------
+    snapshot = quiet_snapshot()
+    for capture_format in CAPTURE_FORMATS:
+        config = AIConfig(capture_format=capture_format)
+        report = build_capture_report(snapshot, str(PCAP), config)
+        expected = build_messages(report, None, None, capture_format)[1]["content"]
+        expected_block = _payload_capture_block(expected)
+        actual = table_block if capture_format == "table" else json_block
+        check(f"the {capture_format} preview matches the message that would be built",
+              actual == expected_block,
+              f"{len(actual)} chars previewed vs {len(expected_block)} expected")
+
+    # -- and the analyzer really does send that layout -----------------------
+    for capture_format in CAPTURE_FORMATS:
+        config = AIConfig(api_key="test-key", capture_format=capture_format)
+        client = FakeLLMClient(response=sample_analysis())
+        outcome = analyze_capture(snapshot, str(PCAP), config, client=client)
+        check(f"the analyzer runs with capture_format={capture_format}", outcome.ok)
+        sent = _payload_capture_block(client.last_messages[1]["content"])
+        previewed = table_block if capture_format == "table" else json_block
+        check(f"what the analyzer sends matches the {capture_format} preview",
+              sent == previewed,
+              f"{len(sent)} sent vs {len(previewed)} previewed")
+        check(f"the recorded prompt version reflects {capture_format}",
+              (outcome.prompt_version.endswith("+json")
+               if capture_format == "json" else
+               not outcome.prompt_version.endswith("+json")),
+              outcome.prompt_version)
+
+    # -- the json layout is still the pre-2.0 body, byte for byte ------------
+    config = AIConfig(capture_format="json")
+    report = build_capture_report(snapshot, str(PCAP), config)
+    payload = report.model_dump(mode="json", exclude_none=True)
+    check("the json layout is still exactly json.dumps(indent=2, sort_keys=True)",
+          json_block.strip() == json.dumps(payload, indent=2, sort_keys=True,
+                                           ensure_ascii=True))
+
+
 def test_live_groq() -> None:
     print("\nLive API - Groq (optional)")
     from ai.analyzer import analyze_capture
@@ -900,8 +1022,8 @@ def main() -> int:
     for fn in (test_config, test_schemas, test_snapshot, test_redaction,
                test_extractor, test_prompts, test_client_and_analyzer,
                test_report, test_isolation, test_providers,
-               test_provider_failures, test_live_groq, test_live_ollama,
-               test_live_api):
+               test_provider_failures, test_show_payload_capture_format,
+               test_live_groq, test_live_ollama, test_live_api):
         fn()
 
     total = _passed + _failed
