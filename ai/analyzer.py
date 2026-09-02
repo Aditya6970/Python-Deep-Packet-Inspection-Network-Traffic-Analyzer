@@ -33,7 +33,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only; ai/ never needs ai/rag/
     from .rag.context import KnowledgeContext
     from .rag.pipeline import KnowledgePipeline, RAGOutcome
 
-__all__ = ["AnalysisOutcome", "analyze_capture", "explain_failure"]
+__all__ = ["AnalysisOutcome", "analyze_capture", "build_request_messages",
+           "explain_failure"]
 
 
 #: Human-readable explanations, so a failure tells the user what to do.
@@ -167,6 +168,36 @@ class AnalysisOutcome:
         return explain_failure(self.failure, self.config)
 
 
+def build_request_messages(
+    report: CaptureReport,
+    cfg: AIConfig,
+    knowledge_text: str | None = None,
+) -> list[dict[str, str]]:
+    """Assemble exactly the messages a request under ``cfg`` would carry.
+
+    The single place that decides whether the response schema travels in the
+    prompt.  Providers that can constrain generation themselves -- Groq in
+    ``JSON_SCHEMA`` mode, OpenAI in ``NATIVE_PARSE`` -- receive it in
+    ``response_format`` and must not be given it twice; ``JSON_OBJECT``
+    providers (Ollama) guarantee only *valid JSON*, so for them the schema has
+    to be described in the system message instead.  Either way the reply is
+    validated against the same :class:`~ai.schemas.AnalysisResult`.
+
+    It exists as a function so that ``analyze_ai.py --show-payload`` can print
+    the request rather than an approximation of it.  Both previously called
+    :func:`~ai.prompts.build_messages` directly and drifted apart twice: on the
+    capture format (step 13) and on this schema (step 14), each time leaving a
+    flag documented as "exactly what would be sent" showing something else.
+    One caller cannot disagree with itself.
+    """
+    schema = (
+        AnalysisResult.model_json_schema()
+        if cfg.spec.structured_mode is StructuredMode.JSON_OBJECT
+        else None
+    )
+    return build_messages(report, schema, knowledge_text, cfg.capture_format)
+
+
 def analyze_capture(
     snapshot: FlowSnapshot,
     capture_path: str | Path,
@@ -226,15 +257,9 @@ def analyze_capture(
         )
 
     # --- non-deterministic stage ------------------------------------------
-    # Providers that cannot constrain generation themselves are given the
-    # schema in the prompt instead.  Either way the response is validated
-    # against the same AnalysisResult below.
-    schema = (
-        AnalysisResult.model_json_schema()
-        if cfg.spec.structured_mode is StructuredMode.JSON_OBJECT
-        else None
-    )
-    messages = build_messages(report, schema, knowledge_text, cfg.capture_format)
+    # Either way the response is validated against the same AnalysisResult
+    # below; build_request_messages decides only what the provider is told.
+    messages = build_request_messages(report, cfg, knowledge_text)
     result = llm.complete_structured(messages, AnalysisResult)
 
     if not result.ok or not isinstance(result.parsed, AnalysisResult):

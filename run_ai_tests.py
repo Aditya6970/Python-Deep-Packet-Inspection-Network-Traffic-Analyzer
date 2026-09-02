@@ -911,6 +911,167 @@ def test_show_payload_capture_format() -> None:
                                            ensure_ascii=True))
 
 
+#: Providers and whether their structured mode makes the response schema
+#: travel *inside the prompt*.  Ollama is JSON_OBJECT and needs it; Groq
+#: (JSON_SCHEMA) and OpenAI (NATIVE_PARSE) carry it in ``response_format``
+#: instead and must not receive it twice.  Derived from the provider registry
+#: rather than restated, so a new provider cannot silently escape this test.
+def _schema_travels_in_prompt(provider: str) -> bool:
+    from ai.providers import StructuredMode, get_provider_spec, parse_provider
+
+    spec = get_provider_spec(parse_provider(provider))
+    return spec.structured_mode is StructuredMode.JSON_OBJECT
+
+
+def _payload_messages(text: str) -> tuple[str, str]:
+    """The system and user messages out of a --show-payload dump.
+
+    Parsed back out of what the CLI actually printed, so the comparison below
+    is against bytes a user would see -- not against an object the test built.
+    """
+    body = text.split("===== EXACTLY WHAT WOULD BE SENT =====\n", 1)[1]
+    system = body.split("--- role: system ---\n", 1)[1].split(
+        "\n\n--- role: user ---\n", 1)[0]
+    user = body.split("--- role: user ---\n", 1)[1]
+    # print(content) then print() appends exactly two newlines after the last
+    # message; nothing else follows, because --show-payload returns there.
+    return system, user[:-2] if user.endswith("\n\n") else user
+
+
+def test_show_payload_provider_schema() -> None:
+    """--show-payload must preview what *this provider* would actually be sent.
+
+    Step 13 fixed one half of this: the preview ignored ``DPI_CAPTURE_FORMAT``
+    and always rendered the table. The other half survived it. The CLI called
+    ``build_messages(report, None, ...)`` with the schema hard-coded to
+    ``None``, while :func:`ai.analyzer.analyze_capture` passes a real schema
+    whenever the provider is in ``JSON_OBJECT`` mode. For Ollama the schema
+    travels in the *system* message, so the preview omitted it entirely -- and
+    Step 13's test could not see that, because it only ever inspected the user
+    message's capture block.
+
+    So this compares the whole of both messages, for every provider and every
+    capture format, against what the analyzer hands the client. It asserts on
+    printed bytes rather than on how a function was called: a preview that
+    reconstructs the right string by a different route still passes, and one
+    that calls the right function but prints something else still fails.
+    """
+    print("\nStep 14 - --show-payload previews the real messages per provider")
+
+    import analyze_ai
+    from ai.analyzer import analyze_capture
+    from ai.config import AIConfig
+    from ai.llm_client import FakeLLMClient
+    from ai.prompts import CAPTURE_FORMATS
+
+    if not PCAP.is_file():
+        skip("--show-payload matches the request for every provider",
+             "test_dpi.pcap is not present")
+        return
+
+    providers = ("groq", "openai", "ollama")
+    # A value that would be a catastrophic leak if it ever reached a prompt.
+    # It is not a credential: nothing accepts it, and it exists only so the
+    # absence check has something specific to look for.
+    secret = "gsk_" + "STEP14_MUST_NOT_APPEAR_IN_ANY_PREVIEW"
+
+    saved = {name: os.environ.get(name) for name in
+             ("DPI_CAPTURE_FORMAT", "GROQ_API_KEY", "OPENAI_API_KEY")}
+    previewed: dict[tuple[str, str], tuple[str, str]] = {}
+
+    try:
+        os.environ["GROQ_API_KEY"] = secret
+        os.environ["OPENAI_API_KEY"] = secret
+        snapshot = quiet_snapshot()
+
+        for provider in providers:
+            wants_schema = _schema_travels_in_prompt(provider)
+            for capture_format in CAPTURE_FORMATS:
+                # os.environ wins over .env (see ai.config.load_dotenv), so
+                # this is authoritative even on a machine that has one.
+                os.environ["DPI_CAPTURE_FORMAT"] = capture_format
+                label = f"{provider}/{capture_format}"
+
+                # -- what the CLI prints ------------------------------------
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    code = analyze_ai.main(
+                        ["analyze_ai.py", str(PCAP), "--show-payload",
+                         "--no-rag", "--provider", provider])
+                check(f"--show-payload exits zero for {label}", code == 0, str(code))
+                pv_system, pv_user = _payload_messages(buffer.getvalue())
+                previewed[(provider, capture_format)] = (pv_system, pv_user)
+
+                # -- what the production path actually sends ----------------
+                # Same construction the CLI uses, including the .env read, so
+                # any divergence found below is the code's and not the test's.
+                cfg = AIConfig.from_env(provider=provider)
+                if cfg.api_key is None:
+                    cfg.api_key = "test-key"
+                client = FakeLLMClient(response=sample_analysis(),
+                                       provider_name=provider)
+                outcome = analyze_capture(snapshot, str(PCAP), cfg, client=client)
+                check(f"the analyzer runs for {label}", outcome.ok, str(outcome.detail))
+                sent_system = client.last_messages[0]["content"]
+                sent_user = client.last_messages[1]["content"]
+
+                # -- the actual regression ----------------------------------
+                check(f"{label}: the previewed SYSTEM message is byte-identical "
+                      f"to the one that would be sent",
+                      pv_system == sent_system,
+                      f"{len(pv_system)} previewed vs {len(sent_system)} sent")
+                check(f"{label}: the previewed USER message is byte-identical "
+                      f"to the one that would be sent",
+                      pv_user == sent_user,
+                      f"{len(pv_user)} previewed vs {len(sent_user)} sent")
+
+                # -- provider capability, observed on both sides -------------
+                where = "carries" if wants_schema else "omits"
+                check(f"{label}: the request {where} the output-schema instruction",
+                      ("OUTPUT FORMAT" in sent_system) is wants_schema)
+                check(f"{label}: the preview {where} it too",
+                      ("OUTPUT FORMAT" in pv_system) is wants_schema)
+
+                # -- nothing secret is ever previewed ------------------------
+                check(f"{label}: no API key appears in the preview",
+                      secret not in pv_system and secret not in pv_user)
+
+                # -- the recorded contract still says which layout produced it
+                expected_version = "2.0+json" if capture_format == "json" else "2.0"
+                check(f"{label}: prompt version is {expected_version}",
+                      outcome.prompt_version == expected_version,
+                      outcome.prompt_version)
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    # -- the capture format still changes, and still loses no flow -----------
+    for provider in providers:
+        table_user = previewed[(provider, "table")][1]
+        json_user = previewed[(provider, "json")][1]
+        check(f"{provider}: the two capture formats preview different bytes",
+              table_user != json_user)
+        ids_table = _flow_ids(_payload_capture_block(table_user), "table")
+        ids_json = _flow_ids(_payload_capture_block(json_user), "json")
+        check(f"{provider}: both formats preview the same flow ids",
+              ids_table == ids_json and len(ids_table) > 0,
+              f"{len(ids_table)} vs {len(ids_json)}")
+
+    # -- and the provider is what distinguishes the system message ----------
+    groq_system = previewed[("groq", "table")][0]
+    openai_system = previewed[("openai", "table")][0]
+    ollama_system = previewed[("ollama", "table")][0]
+    check("groq and openai preview the same system message",
+          groq_system == openai_system,
+          f"{len(groq_system)} vs {len(openai_system)}")
+    check("ollama previews a larger system message than groq",
+          len(ollama_system) > len(groq_system),
+          f"{len(ollama_system)} vs {len(groq_system)}")
+
+
 def test_live_groq() -> None:
     print("\nLive API - Groq (optional)")
     from ai.analyzer import analyze_capture
@@ -1023,6 +1184,7 @@ def main() -> int:
                test_extractor, test_prompts, test_client_and_analyzer,
                test_report, test_isolation, test_providers,
                test_provider_failures, test_show_payload_capture_format,
+               test_show_payload_provider_schema,
                test_live_groq, test_live_ollama, test_live_api):
         fn()
 

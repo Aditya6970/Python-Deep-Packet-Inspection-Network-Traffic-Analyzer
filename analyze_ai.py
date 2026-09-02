@@ -246,8 +246,8 @@ def main(argv: list[str] | None = None) -> int:
                 pipeline = default_pipeline()
 
     if show_payload:
+        from ai.analyzer import build_request_messages
         from ai.extractor import build_capture_report
-        from ai.prompts import build_messages
 
         report = build_capture_report(snapshot, input_file, ai_config)
         knowledge_text = None
@@ -257,12 +257,14 @@ def main(argv: list[str] | None = None) -> int:
             if knowledge_text is None:
                 print(f"\n[no reference knowledge: {rag_outcome.status.value} -- "
                       f"{rag_outcome.describe()}]")
-        # The capture format comes from the same config the analyzer uses, so
-        # this preview shows the layout that would actually be sent.  Passing
-        # the default instead made --show-payload silently disagree with the
-        # real request whenever DPI_CAPTURE_FORMAT was set to json.
-        messages = build_messages(report, None, knowledge_text,
-                                  ai_config.capture_format)
+        # Built by the analyzer's own assembler, from the same config, so the
+        # preview cannot disagree with the request.  Calling build_messages()
+        # here instead meant choosing the capture format and the response
+        # schema a second time, and both choices drifted: the format ignored
+        # DPI_CAPTURE_FORMAT, and the schema was hard-coded to None, which
+        # dropped ~5,700 characters of output-format instruction from the
+        # preview for JSON_OBJECT providers such as Ollama.
+        messages = build_request_messages(report, ai_config, knowledge_text)
         print("\n===== EXACTLY WHAT WOULD BE SENT =====\n")
         for m in messages:
             print(f"--- role: {m['role']} ---")
